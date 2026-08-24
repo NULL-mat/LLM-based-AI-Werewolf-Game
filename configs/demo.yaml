@@ -1,0 +1,14 @@
+game:
+  player_count: 7
+  max_days: 8
+  roles:
+    - Werewolf
+    - Werewolf
+    - Seer
+    - Witch
+    - Hunter
+    - Guard
+    - Villager
+agents:
+  type: heuristic
+  seed: 7
