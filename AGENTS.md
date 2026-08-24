@@ -2,7 +2,29 @@
 
 > **项目根目录**: `/home/fyh0106/AIwerewolf/`
 > **参考仓库**: `/home/fyh0106/AIwerewolf/references/`
-> **完整手册**: `SKILLS.md`（建议先读）
+
+## AI 助手开工指引（**必读**）
+
+接到任务后，按下面顺序读，缺一不可：
+
+1. **本文件（AGENTS.md）** — 项目速查
+2. **`SKILLS.md`** — 狼人杀业务知识 + 参考仓库
+3. **`skills/README.md`** → 进入 **团队协作规范** 索引：
+   - `skills/00-team-overview.md` — **全员必读**：三人横向分工、决策权
+   - `skills/10-git-workflow.md` — **全员必读**：分支 / Commit / PR / Review
+   - `skills/70-ai-collaboration.md` — **必读**：你（AI）必须遵守的红线
+   - 改后端代码：`skills/20-backend-conventions.md`
+   - 改前端代码：`skills/30-frontend-conventions.md`
+   - 改 Agent：`skills/40-agent-development.md`
+   - 改 API / Schema：`skills/50-api-contract.md`（任何跨前后端必读）
+   - 写测试：`skills/60-testing-ci.md`
+
+**铁律**：动代码前必须查对应 skills/ 文件；跨模块改动必须先列计划让人类确认。
+**披露**：PR 描述里必须说明哪些代码由 AI 生成（详见 `skills/70`）。
+
+> 本文件与 `CLAUDE.md` **内容等价**，仅入口名不同（Claude Code 读 `CLAUDE.md`，Codex 通常读本文件）。改一份要同步改另一份。
+
+---
 
 ## 项目概述
 
@@ -18,7 +40,7 @@ AI 狼人杀多智能体对战系统 — 多 Agent 在信息不对称下协作/�
 ## 项目结构
 
 ```
-/home/fyh0106/AIwerewolf/
+AIwerewolf/
 ├── CLAUDE.md / AGENTS.md  # Agent 指令文件
 ├── SKILLS.md              # 完整开发手册
 ├── README.md
@@ -35,7 +57,7 @@ AI 狼人杀多智能体对战系统 — 多 Agent 在信息不对称下协作/�
 
 ## 参考仓库速查
 
-全部在 `/home/fyh0106/AIwerewolf/references/`：
+全部在 `AIwerewolf/references/`：
 
 | 优先级 | 仓库 | 目录名 | 核心价值 |
 |--------|------|--------|----------|
@@ -50,16 +72,16 @@ AI 狼人杀多智能体对战系统 — 多 Agent 在信息不对称下协作/�
 | #9 | AlecM33/Werewolf | `Werewolf/` | 主持工具 (⚠️GPL-3.0) |
 | #10 | lykoss/lykos | `lykos/` | Python IRC Bot、复杂角色 |
 
-### 最关键的3个文件 (绝对路径)
+### 最关键的3个文件 (相对路径)
 
-1. `/home/fyh0106/AIwerewolf/references/WereWolfPlus/agent_manager/prompts/werewolf_prompt.py`
+1. `AIwerewolf/references/WereWolfPlus/agent_manager/prompts/werewolf_prompt.py`
    - 完整Prompt模板: 18种动作 × 多角色 × JSON Schema
    - 包含: GAME规则→STATE状态→OBSERVATIONS→角色策略→输出格式
    
-2. `/home/fyh0106/AIwerewolf/references/wolfcha/src/types/game.ts`
+2. `AIwerewolf/references/wolfcha/src/types/game.ts`
    - Phase枚举(22个阶段)、Player类型、Persona系统定义
    
-3. `/home/fyh0106/AIwerewolf/references/AIWolfPy/aiwolfpy/agentproxy.py`
+3. `AIwerewolf/references/AIWolfPy/aiwolfpy/agentproxy.py`
    - Agent接口: initialize→update→dayStart→{talk/vote/attack/divine/guard}→finish
 
 ## 狼人杀核心规则
@@ -133,12 +155,12 @@ GAME规则(固定) → STATE状态(轮次/角色/存活) → OBSERVATIONS私有�
 
 | 问题 | 去哪里看 |
 |------|----------|
-| Agent接口怎么写? | `/home/fyh0106/AIwerewolf/references/AIWolfPy/aiwolfpy/agentproxy.py` |
-| Prompt模板? | `/home/fyh0106/AIwerewolf/references/WereWolfPlus/agent_manager/prompts/werewolf_prompt.py` |
-| 角色定义和平衡? | `/home/fyh0106/AIwerewolf/references/werewolf-brain/src/data/cards.json` |
-| 夜晚动作顺序? | `/home/fyh0106/AIwerewolf/references/werewolf-brain/src/data/sequence.json` |
-| 阶段怎么设计? | `/home/fyh0106/AIwerewolf/references/wolfcha/src/types/game.ts` |
-| 信息隔离怎么做? | `/home/fyh0106/AIwerewolf/references/werewolf/werewolf-backend/src/models/PlayerModel.ts` (getPublic方法) |
-| WebSocket事件定义? | `/home/fyh0106/AIwerewolf/references/werewolf/werewolf-frontend/shared/WSEvents.ts` |
-| 评测指标? | `/home/fyh0106/AIwerewolf/references/WereWolfPlus/agent_eval/agent_eval.py` |
-| 事件驱动架构? | `/home/fyh0106/AIwerewolf/references/open_mafia_engine/open_mafia_engine/core/` |
+| Agent接口怎么写? | `AIwerewolf/references/AIWolfPy/aiwolfpy/agentproxy.py` |
+| Prompt模板? | `AIwerewolf/references/WereWolfPlus/agent_manager/prompts/werewolf_prompt.py` |
+| 角色定义和平衡? | `AIwerewolf/references/werewolf-brain/src/data/cards.json` |
+| 夜晚动作顺序? | `AIwerewolf/references/werewolf-brain/src/data/sequence.json` |
+| 阶段怎么设计? | `AIwerewolf/references/wolfcha/src/types/game.ts` |
+| 信息隔离怎么做? | `AIwerewolf/references/werewolf/werewolf-backend/src/models/PlayerModel.ts` (getPublic方法) |
+| WebSocket事件定义? | `AIwerewolf/references/werewolf/werewolf-frontend/shared/WSEvents.ts` |
+| 评测指标? | `AIwerewolf/references/WereWolfPlus/agent_eval/agent_eval.py` |
+| 事件驱动架构? | `AIwerewolf/references/open_mafia_engine/open_mafia_engine/core/` |

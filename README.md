@@ -27,12 +27,23 @@ python -m pip install -r requirements.txt
 # 2. 配置 LLM API（已提供 .env.example，复制后填上 key）
 cp .env.example .env  # 编辑填入 DOUBAO_API_KEY 或 DEEPSEEK_API_KEY
 
-# 3. 本地跑一局（启发式 Agent，秒级出结果）
-python -m backend.run_demo --seed 7
+# 3. 启动本地 Postgres（推荐，跟 .env 默认值对齐；不装也行，会自动 fallback 到 SQLite）
+make db-up
 
-# 4. 启动后端服务
-uvicorn backend.app:app --host 0.0.0.0 --port 8000
+# 4. 本地跑一局（启发式 Agent，秒级出结果）
+make demo
+
+# 5. 启动后端服务
+make dev   # 等价 uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 # 浏览器打开 http://localhost:8000
+```
+
+一条命令拉起全栈（Postgres + 后端）：
+
+```bash
+make compose-up    # 等价 docker compose up -d --build
+make compose-logs  # 看后端日志
+make compose-down
 ```
 
 ## 三种玩法
@@ -49,11 +60,30 @@ uvicorn backend.app:app --host 0.0.0.0 --port 8000
 
 ### C. API 直接调用
 
+#### 核心 (MVP)
 ```bash
 curl -X POST "http://localhost:8000/api/rooms?name=Demo&seed=7&player_count=7&agent_type=llm"
 curl -X POST "http://localhost:8000/api/rooms/<room_id>/games"
 curl "http://localhost:8000/api/history"
 curl "http://localhost:8000/api/history/<game_id>"
+```
+
+#### 进阶预留（B：评测复盘 / C：自进化）
+```bash
+# 整局回放（含全部事件+决策，可加 ?show_private=true 看主持视角）
+curl "http://localhost:8000/api/replay/<game_id>"
+# 单局多维指标（按玩家分组）
+curl "http://localhost:8000/api/games/<game_id>/metrics"
+# 聚合排行榜（按角色 + agent_type 聚合，可加 ?role=Werewolf）
+curl "http://localhost:8000/api/leaderboard"
+# 评测 agent 写入的复盘报告（暂为空，待 Track B reviewer 接入）
+curl "http://localhost:8000/api/games/<game_id>/reviews"
+# Agent 版本注册表（Track C 自进化使用）
+curl "http://localhost:8000/api/agents"
+curl -X POST "http://localhost:8000/api/agents" -H 'Content-Type: application/json' \
+  -d '{"name":"doubao-v1","agent_type":"llm","model_name":"Doubao-Seed-2.0-pro","prompt_version":"v1"}'
+# 自进化迭代日志
+curl "http://localhost:8000/api/evolution"
 ```
 
 ## 项目结构
@@ -103,19 +133,67 @@ tests/
 
 ## 数据库
 
-默认 SQLite，文件在 `data/werewolf.db`。如需切换 Postgres：
+**生产/团队开发：PostgreSQL 16（Docker，端口 5433）— 当前默认配置**。SQLite 仅作为零依赖 fallback（`DATABASE_URL` 未设时启用）。
+
+### 起 PG + 接入
 
 ```bash
-export DATABASE_URL=postgresql+psycopg2://user:pass@host:5432/werewolf
+# 1. 起 docker postgres（已有同名容器会复用）
+make db-up
+
+# 2. .env 已默认指向本地 PG：
+# DATABASE_URL=postgresql+psycopg2://werewolf:wolf_secret_2026@127.0.0.1:5433/werewolf
+
+# 3. 初始化 schema + 索引
+make db-init
+
+# 4. (可选) 从旧 SQLite 迁移历史对局到 PG（幂等，可重复跑）
+make db-migrate
+
+# 5. 进 psql shell 排查
+make db-shell
 ```
 
-每局结束时入库的内容：
+或者一行起完整栈：`make compose-up`（postgres + backend）。
+
+### 三人共享同一台 PG
+
+5433 端口已绑 `0.0.0.0`，**同机不同账号**的队友直接连同一个 `werewolf-pg` 容器即可——三人对局数据汇集到一个 db，评测/Leaderboard 自动跨人聚合。
+
+> ⚠️ 默认密码 `wolf_secret_2026` 强度一般，仅适用内网/同机访问。若 5433 对外公网开放，**先**改强密码（同时改 `docker run` env、`.env`、`docker-compose.yml`）。
+
+### Schema（11 张表 + 24 个索引）
+
+**MVP 用到 (7 张)**
 - `games` — 一行：id / status / winner / day / seed / 时间戳
 - `players` — 每位玩家身份与最终存活状态
-- `game_events` — 全部事件（public + private 标记）
-- `agent_decisions` — 每次询问的观察 / 原始 LLM 输出 / 解析结果 / 是否合法 / 延迟
+- `game_events` — 全部事件（public / private 标记）
+- `agent_decisions` — 每次询问的观察 / 原始 LLM 输出 / 解析结果 / 是否合法 / 延迟 / token 数
 - `votes` — 每日投票
 - `game_snapshots` — 终局完整快照（公开 + 主持双版本）
+- `evaluations` — 每局每玩家的 KPI（win / survived / speech_count，可由 reviewer agent 追加更多）
+
+**Track B 评测复盘预留 (2 张)**
+- `leaderboard_entries` — 按 `(agent_label, role)` 聚合的胜率与 KPI
+- `review_reports` — Reviewer agent 输出的关键决策复盘 / 反事实分析 / 改进建议
+
+**Track C 自进化预留 (2 张)**
+- `agent_versions` — Agent 版本登记表（prompt / model / config 快照），支持 parent 链
+- `evolution_rounds` — 每轮 baseline vs challenger 的 20 局对战结果，可回溯
+
+### 索引（PG 上自动建立）
+
+按高频查询模式建了 24 个索引：
+
+| 表 | 复合索引 | 用途 |
+|---|---|---|
+| `games` | `created_at DESC` / `(status, rule_pack_id)` | 历史列表 / 板子级胜率 |
+| `players` | `(game_id, seat_no)` / `(model_name, role)` | 座位渲染 / 模型×角色 KPI |
+| `game_events` | `(game_id, seq)` / `(game_id, event_type)` / `(game_id, day, phase)` | Replay / 事件筛 / 阶段切片 |
+| `agent_decisions` | `(game_id, player_id, day)` / `(is_valid, error_type)` | 复盘 / 失败归因 |
+| `game_snapshots` | `(game_id, day, phase)` | 跳到任意阶段 |
+| `votes` | `(game_id, day)` / `voter_id` | 票型分析 / 玩家投票画像 |
+| `evaluations` | `(metric_name, player_id)` | 跨局指标聚合 |
 
 ## 测试
 
