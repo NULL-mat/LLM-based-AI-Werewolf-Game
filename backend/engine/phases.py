@@ -30,7 +30,7 @@ class CompositePhase:
     def run(self, game: "WerewolfGame") -> None:
         for step in self.steps:
             step.run(game)
-            if game.state.winner is not None:
+            if game.state.winner is not None or getattr(game, "interrupt_phase_cycle", False):
                 break
 
 
