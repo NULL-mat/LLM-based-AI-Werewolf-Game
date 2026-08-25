@@ -3,20 +3,21 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 import { useAppContext } from "@/context/AppContext";
-import { t } from "@/lib/i18n";
+import { t, tPhase } from "@/lib/i18n";
 import { truncate } from "@/lib/utils";
 import {
   WebSocketMessage,
   WebSocketRequest,
   Language,
-  AgentType,
   ViewMode,
   Phase,
 } from "@/types";
 import { Button } from "@/components/ui/Button";
 import { PlayerCard } from "@/components/game/PlayerCard";
-import { DayBlock } from "@/components/game/DayBlock";
 import { ActionPanel } from "@/components/game/ActionPanel";
+import { ChatBubble } from "@/components/game/ChatBubble";
+import { EventItem } from "@/components/game/EventItem";
+import { EventType } from "@/types";
 
 export default function GamePage() {
   const router = useRouter();
@@ -27,18 +28,34 @@ export default function GamePage() {
   const humanSeat = Number(searchParams.get("human_seat") || 1);
 
   const {
-    language, setLanguage, viewMode, setViewMode, agentType, setAgentType,
+    language, setLanguage, viewMode, setViewMode, agentType,
     room, setRoom, gameState, setGameState, isPlaying, setIsPlaying,
-    speed, setSpeed, seed, setSeed,
+    speed, seed,
   } = useAppContext();
 
   const [showWinnerPanel, setShowWinnerPanel] = useState(false);
   const [ballPos, setBallPos] = useState<{ x: number; y: number } | null>(null);
   const dragRef = useRef({ dragging: false, startX: 0, startY: 0, origX: 0, origY: 0, moved: false });
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
   const [statusTitle, setStatusTitle] = useState(
     gameState?.winner ? t("statusLoaded", language) : t("statusReady", language)
   );
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Auto-scroll to latest messages, pause when user scrolls up
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !autoScrollRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [gameState?.events?.length]);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    autoScrollRef.current = atBottom;
+  };
 
   // Sync status when gameState arrives (e.g., from lobby pre-start)
   useEffect(() => {
@@ -129,11 +146,22 @@ export default function GamePage() {
     return b;
   }, [gameState?.events]);
 
-  const leftPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat <= 4), [gameState?.players]);
-  const rightPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat > 4), [gameState?.players]);
+  // Split players evenly: ceil(N/2) left, floor(N/2) right
+  const splitPoint = useMemo(() => Math.ceil((gameState?.players?.length || 7) / 2), [gameState?.players?.length]);
+  const leftPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat <= splitPoint), [gameState?.players, splitPoint]);
+  const rightPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat > splitPoint), [gameState?.players, splitPoint]);
   const aliveCount = gameState?.alive_count || gameState?.players?.filter((p: any) => p.alive).length || 0;
   const pendingInput = gameState?.pending_input;
   const isHumanMode = mode === "human";
+
+  // Find human player's role and wolf teammates for PlayerCard own-role display
+  const humanPlayer = useMemo(() => (gameState?.players || []).find((p: any) => p.seat === humanSeat), [gameState?.players, humanSeat]);
+  const wolfTeammates = useMemo(() => {
+    if (!isHumanMode || humanPlayer?.alignment !== "wolf") return undefined;
+    return (gameState?.players || [])
+      .filter((p: any) => p.alignment === "wolf" && p.seat !== humanSeat)
+      .map((p: any) => p.name);
+  }, [gameState?.players, humanPlayer, humanSeat, isHumanMode]);
 
   function ph(from: number, to: number) {
     const arr = [];
@@ -158,11 +186,11 @@ export default function GamePage() {
         </div>
         <div className="flex items-center gap-2 mx-auto">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
-            className={isNight ? "text-accent" : "text-accent"}>
+            className={isNight ? "text-primary" : "text-accent"}>
             {isNight ? <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /> :
               <><circle cx="12" cy="12" r="5" /><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" /></>}
           </svg>
-          <span className="font-display text-sm font-semibold text-textPrimary">
+          <span className="font-display text-lg font-bold text-textPrimary">
             {gameState ? (language === "zh" ? `第${gameState.day}天` : `Day ${gameState.day}`) : t("statusReady", language)}
             {gameState?.winner && <span className="ml-2 text-accent"> - {gameState.winner === "village" ? t("village", language) : t("wolf", language)}</span>}
           </span>
@@ -183,25 +211,84 @@ export default function GamePage() {
 
       {/* Main */}
       <div className="flex-1 flex relative z-10 overflow-hidden">
-        <aside className="hidden lg:flex flex-col gap-2 p-3 w-[20%] min-w-[130px] max-w-[200px] overflow-y-auto"
+        <aside className="hidden lg:flex flex-col gap-2 p-3 w-[21%] min-w-[150px] overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
           style={{ borderRight: `1px solid var(--color-border)` }}>
-          {(leftPlayers.length > 0 ? leftPlayers : ph(1, 4)).map((p: any, i: number) => (
-            <PlayerCard key={p.id || i} player={p} />
+          {(leftPlayers.length > 0 ? leftPlayers : ph(1, Math.ceil((gameState?.players?.length || 7) / 2))).map((p: any, i: number) => (
+            <PlayerCard key={p.id || i} player={p}
+              isSpeaking={pendingInput?.player_id === p.id}
+              showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+              wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
+            />
           ))}
         </aside>
 
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-          <div className="px-4 py-1.5 border-b text-xs text-text-sub flex items-center gap-3"
+          <div className="px-5 py-2.5 border-b text-sm text-text-sub flex items-center gap-3 font-medium"
             style={{ background: "var(--color-card)", borderColor: "var(--color-border)" }}>
-            <span>{statusTitle}</span>
+            <span className="font-semibold">{statusTitle}</span>
+            {gameState?.phase && <span>· {tPhase(gameState.phase, language)}</span>}
             <span>· {t("aliveCount", language)}: {aliveCount}/{gameState?.players?.length || 0}</span>
             <span>· {t("events", language)}: {gameState?.event_count || 0}</span>
           </div>
-          <div className="flex-1 overflow-y-auto px-4 py-3">
+          <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-3">
             {gameState?.events?.length ? (
-              Object.keys(dayBlocks).sort((a, b) => Number(b) - Number(a)).map((dk) => (
-                <DayBlock key={dk} day={Number(dk)} events={dayBlocks[Number(dk)]} />
-              ))
+              Object.keys(dayBlocks).sort((a, b) => Number(b) - Number(a)).map((dk) => {
+                const dayEvents = dayBlocks[Number(dk)];
+                // Find deaths for day header
+                const deaths = dayEvents.filter((e: any) =>
+                  e.type === EventType.PLAYER_DIED || e.type === EventType.HUNTER_SHOT || e.type === EventType.WHITE_WOLF_KING_BOOM
+                );
+                return (
+                  <div key={dk} className="mb-5">
+                    {/* Day header */}
+                    <div className="flex items-center gap-3 mb-3 pb-2 border-b" style={{ borderColor: "var(--color-border)" }}>
+                      <span className="font-display text-2xl font-bold text-primary">D{dk}</span>
+                      {deaths.length > 0 && (
+                        <span className="text-xs text-danger truncate">
+                          {deaths.map((d: any) => d.payload.player_name || d.payload.target_name || "?").join(" · ")} {language === "zh" ? "出局" : "died"}
+                        </span>
+                      )}
+                    </div>
+                    {/* Events */}
+                    <div className="space-y-0.5">
+                      {dayEvents.map((ev: any, i: number) => {
+                        const isSystem = ev.type === EventType.PHASE_CHANGED || ev.type === EventType.GAME_START
+                          || ev.type === EventType.GAME_END || ev.type === EventType.SYSTEM_MESSAGE;
+                        const isChat = ev.type === EventType.CHAT_MESSAGE;
+
+                        if (isSystem) {
+                          const iconMap: Record<string, string> = {
+                            GAME_START: "\u{1F3AE}", PHASE_CHANGED: "", GAME_END: "\u{1F3C6}", SYSTEM_MESSAGE: "\u{1F4E2}",
+                          };
+                          const msg = ev.payload.message || ev.payload.phase
+                            ? tPhase(ev.payload.phase, language) : "";
+                          const icon = iconMap[ev.type] || "";
+                          return (
+                            <ChatBubble
+                              key={ev.id || i}
+                              speakerName=""
+                              content={icon ? `${icon} ${msg}` : msg}
+                              isSystem
+                            />
+                          );
+                        }
+                        if (isChat) {
+                          return (
+                            <ChatBubble
+                              key={ev.id || i}
+                              speakerName={ev.payload.actor_name || "?"}
+                              content={ev.payload.speech || ""}
+                              isOwn={isHumanMode && ev.payload.actor_id?.startsWith(`P${humanSeat}-`)}
+                              phaseLabel={tPhase(ev.phase, language)}
+                            />
+                          );
+                        }
+                        return <EventItem key={ev.id || i} event={ev} index={i} />;
+                      })}
+                    </div>
+                  </div>
+                );
+              })
             ) : (
               <div className="flex flex-col items-center justify-center h-full text-center py-20">
                 <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round"
@@ -212,21 +299,32 @@ export default function GamePage() {
             )}
           </div>
           {pendingInput && (
-            <ActionPanel pendingInput={pendingInput} onAction={handleHumanAction} language={language} />
+            <ActionPanel pendingInput={pendingInput} onAction={handleHumanAction} language={language}
+              votes={gameState?.votes}
+              players={gameState?.players}
+            />
           )}
         </main>
 
-        <aside className="hidden lg:flex flex-col gap-2 p-3 w-[15%] min-w-[110px] max-w-[160px] overflow-y-auto"
+        <aside className="hidden lg:flex flex-col gap-2 p-3 w-[21%] min-w-[150px] overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
           style={{ borderLeft: `1px solid var(--color-border)` }}>
-          {(rightPlayers.length > 0 ? rightPlayers : ph(5, 7)).map((p: any, i: number) => (
-            <PlayerCard key={p.id || i} player={p} />
+          {(rightPlayers.length > 0 ? rightPlayers : ph(splitPoint + 1, gameState?.players?.length || 7)).map((p: any, i: number) => (
+            <PlayerCard key={p.id || i} player={p}
+              isSpeaking={pendingInput?.player_id === p.id}
+              showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+              wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
+            />
           ))}
         </aside>
       </div>
 
       <div className="lg:hidden relative z-10 flex gap-2 overflow-x-auto px-4 py-2">
-        {((gameState?.players?.length || 0) > 0 ? gameState!.players : ph(1, 7)).map((p: any, i: number) => (
-          <div key={p.id || i} className="flex-shrink-0 w-[100px]"><PlayerCard player={p} /></div>
+        {((gameState?.players?.length || 0) > 0 ? gameState!.players : ph(1, gameState?.players?.length || 7)).map((p: any, i: number) => (
+          <div key={p.id || i} className="flex-shrink-0 w-[100px]"><PlayerCard player={p}
+            isSpeaking={pendingInput?.player_id === p.id}
+            showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+            wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
+          /></div>
         ))}
       </div>
 
