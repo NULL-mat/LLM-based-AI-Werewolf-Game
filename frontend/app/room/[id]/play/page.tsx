@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { useParams, useSearchParams } from "next/navigation";
+import { useParams, useSearchParams, useRouter } from "next/navigation";
 import { useAppContext } from "@/context/AppContext";
 import { t } from "@/lib/i18n";
 import { truncate } from "@/lib/utils";
@@ -19,6 +19,7 @@ import { DayBlock } from "@/components/game/DayBlock";
 import { ActionPanel } from "@/components/game/ActionPanel";
 
 export default function GamePage() {
+  const router = useRouter();
   const params = useParams<{ id: string }>();
   const searchParams = useSearchParams();
   const roomId = params.id;
@@ -31,8 +32,26 @@ export default function GamePage() {
     speed, setSpeed, seed, setSeed,
   } = useAppContext();
 
-  const [statusTitle, setStatusTitle] = useState(t("statusReady", language));
+  const [showWinnerPanel, setShowWinnerPanel] = useState(false);
+  const [ballPos, setBallPos] = useState({ x: 0, y: 0 });
+  const dragRef = useRef({ dragging: false, startX: 0, startY: 0, origX: 0, origY: 0, moved: false });
+  const [statusTitle, setStatusTitle] = useState(
+    gameState?.winner ? t("statusLoaded", language) : t("statusReady", language)
+  );
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Sync status when gameState arrives (e.g., from lobby pre-start)
+  useEffect(() => {
+    if (gameState) {
+      if (gameState.winner) {
+        setStatusTitle(t("statusLoaded", language));
+        setIsPlaying(false);
+      } else if (gameState.pending_input) {
+        setStatusTitle(t("statusStreaming", language));
+        setIsPlaying(true);
+      }
+    }
+  }, [gameState?.id]);
 
   const isNight = useMemo(() => {
     const p = gameState?.phase || "";
@@ -153,8 +172,8 @@ export default function GamePage() {
             <button onClick={() => setViewMode(ViewMode.PUBLIC)} className={`px-2 py-1 text-xs font-medium ${viewMode === ViewMode.PUBLIC ? "bg-primary text-white" : "bg-transparent text-text-sub"}`}>{t("public", language)}</button>
             <button onClick={() => setViewMode(ViewMode.MODERATOR)} className={`px-2 py-1 text-xs font-medium ${viewMode === ViewMode.MODERATOR ? "bg-primary text-white" : "bg-transparent text-text-sub"}`}>{t("private", language)}</button>
           </div>
-          {!isPlaying && !isHumanMode && <Button size="sm" onClick={runGame}>{t("run", language)}</Button>}
-          {!isPlaying && isHumanMode && <Button size="sm" onClick={startHumanGame}>{t("run", language)}</Button>}
+          {!isPlaying && !isHumanMode && !gameState?.winner && <Button size="sm" onClick={runGame}>{t("run", language)}</Button>}
+          {!isPlaying && isHumanMode && !gameState?.winner && <Button size="sm" onClick={startHumanGame}>{t("run", language)}</Button>}
           <div className="flex rounded-button border overflow-hidden" style={{ borderColor: "var(--color-border)" }}>
             <button onClick={() => setLanguage(Language.ZH)} className={`px-2 py-1 text-xs font-medium ${language === "zh" ? "bg-primary text-white" : "bg-transparent text-text-sub"}`}>中</button>
             <button onClick={() => setLanguage(Language.EN)} className={`px-2 py-1 text-xs font-medium ${language === "en" ? "bg-primary text-white" : "bg-transparent text-text-sub"}`}>EN</button>
@@ -210,6 +229,115 @@ export default function GamePage() {
           <div key={p.id || i} className="flex-shrink-0 w-[100px]"><PlayerCard player={p} /></div>
         ))}
       </div>
+
+      {/* ====== Game End: Floating Ball + Expandable Panel ====== */}
+      {gameState?.winner && (
+        <>
+          {/* Floating ball — always visible after game ends */}
+          {!showWinnerPanel && (
+            <button
+              onClick={() => { if (!dragRef.current.moved) setShowWinnerPanel(true); }}
+              onPointerDown={(e) => {
+                dragRef.current = { dragging: true, startX: e.clientX, startY: e.clientY, origX: ballPos.x, origY: ballPos.y, moved: false };
+                (e.target as HTMLElement).setPointerCapture(e.pointerId);
+              }}
+              onPointerMove={(e) => {
+                if (!dragRef.current.dragging) return;
+                const dx = e.clientX - dragRef.current.startX;
+                const dy = e.clientY - dragRef.current.startY;
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragRef.current.moved = true;
+                if (dragRef.current.moved) {
+                  setBallPos({ x: dragRef.current.origX + dx, y: dragRef.current.origY + dy });
+                }
+              }}
+              onPointerUp={() => { dragRef.current.dragging = false; }}
+              className="fixed z-50 flex items-center gap-2.5 pl-3 pr-4 py-2.5 rounded-full animate-scale-in cursor-grab active:cursor-grabbing border-0 shadow-[0_4px_24px_rgba(0,0,0,0.12)] hover:shadow-[0_6px_32px_rgba(0,0,0,0.16)] select-none transition-shadow duration-200"
+              style={{
+                background: "var(--color-card)",
+                border: "1px solid var(--color-border)",
+                right: ballPos.x ? undefined : 24,
+                bottom: ballPos.y ? undefined : 24,
+                transform: ballPos.x ? `translate(${ballPos.x}px, ${-ballPos.y}px)` : undefined,
+              }}
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                className="text-accent animate-breathe">
+                <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5C7 4 8 7 8 7" /><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5C17 4 16 7 16 7" />
+                <path d="M4 22h16" /><path d="M10 22V8c0-1.1.9-2 2-2s2 .9 2 2v14" /><path d="M8 12h8" />
+              </svg>
+              <div className="text-left leading-tight">
+                <p className="text-[10px] text-text-sub">{language === "zh" ? "游戏结束" : "Game Over"}</p>
+                <p className={`text-sm font-bold ${gameState.winner === "village" ? "text-success" : "text-danger"}`}>
+                  {gameState.winner === "village" ? t("village", language) : t("wolf", language)}
+                  {language === "zh" ? "获胜" : " Wins"}
+                </p>
+              </div>
+            </button>
+          )}
+
+          {/* Expanded panel */}
+          {showWinnerPanel && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center"
+              style={{ background: "rgba(0,0,0,0.45)", backdropFilter: "blur(3px)" }}
+              onClick={() => setShowWinnerPanel(false)}>
+              <div className="text-center animate-scale-in px-6 py-8 rounded-card max-w-sm w-full mx-4"
+                style={{ background: "var(--color-card)", boxShadow: "0 16px 64px rgba(0,0,0,0.25)" }}
+                onClick={(e) => e.stopPropagation()}>
+                {/* Trophy */}
+                <div className="mb-3">
+                  <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mx-auto text-accent">
+                    <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5C7 4 8 7 8 7" /><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5C17 4 16 7 16 7" />
+                    <path d="M4 22h16" /><path d="M10 22V8c0-1.1.9-2 2-2s2 .9 2 2v14" /><path d="M8 12h8" />
+                  </svg>
+                </div>
+                <p className="text-sm text-text-sub mb-2">{language === "zh" ? "游戏结束" : "Game Over"}</p>
+                <h2 className={`font-display text-3xl font-bold mb-1 ${gameState.winner === "village" ? "text-success" : "text-danger"}`}>
+                  {gameState.winner === "village" ? t("village", language) : t("wolf", language)}
+                </h2>
+                <p className="font-display text-textPrimary mb-5">
+                  {gameState.winner === "village"
+                    ? (language === "zh" ? "好人阵营获胜" : "Village Wins")
+                    : (language === "zh" ? "狼人阵营获胜" : "Wolves Win")}
+                </p>
+
+                {/* Stats */}
+                <div className="grid grid-cols-3 gap-3 mb-5 text-center">
+                  {[
+                    [String(gameState.day), language === "zh" ? "总天数" : "Days"],
+                    [String(aliveCount), language === "zh" ? "存活" : "Alive"],
+                    [String(gameState.event_count || 0), language === "zh" ? "事件" : "Events"],
+                  ].map(([val, label]) => (
+                    <div key={label}>
+                      <p className="font-display text-2xl font-bold text-primary">{val}</p>
+                      <p className="text-xs text-text-sub">{label}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-3 mb-3">
+                  <Button variant="ghost" onClick={() => router.push("/")} className="flex-1">
+                    {language === "zh" ? "返回大厅" : "Lobby"}
+                  </Button>
+                  <Button onClick={() => router.push("/")} className="flex-1">
+                    {language === "zh" ? "再来一局" : "Play Again"}
+                  </Button>
+                </div>
+
+                {/* Collapse button */}
+                <button
+                  onClick={() => setShowWinnerPanel(false)}
+                  className="text-xs text-text-sub underline hover:text-textPrimary transition-colors"
+                >
+                  {language === "zh" ? "收起面板，留在页面" : "Dismiss, stay on page"}
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
