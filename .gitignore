@@ -218,7 +218,29 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+
+# Tool/agent metadata
+.serena/
+# NOTE: project-level team conventions live in skills/ and ARE tracked.
+
 # Local configuration files (not synced with git)
-AGENTS.md
-CLAUDE.md
-.gitignore
+docs/test-report-*.md
+
+# IDE and editor files
+.trae/
+
+# Build artifacts
+.next/
+tsconfig.tsbuildinfo
+
+# Local data and venv
+data/
+wolf/
+prototype/
+
+# Reference images (large, not code)
+frontend/photos/
+
+# Planning docs (transient)
+plans/
+.claude/skills/

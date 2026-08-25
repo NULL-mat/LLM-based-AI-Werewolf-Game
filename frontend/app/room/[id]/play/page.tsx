@@ -18,6 +18,7 @@ import { ActionPanel } from "@/components/game/ActionPanel";
 import { ChatBubble } from "@/components/game/ChatBubble";
 import { EventItem } from "@/components/game/EventItem";
 import { EventType } from "@/types";
+import { PhaseAnnouncement } from "@/components/game/PhaseAnnouncement";
 
 export default function GamePage() {
   const router = useRouter();
@@ -36,6 +37,9 @@ export default function GamePage() {
   const [showWinnerPanel, setShowWinnerPanel] = useState(false);
   const [ballPos, setBallPos] = useState<{ x: number; y: number } | null>(null);
   const dragRef = useRef({ dragging: false, startX: 0, startY: 0, origX: 0, origY: 0, moved: false });
+  // Phase announcement state
+  const [announcePhase, setAnnouncePhase] = useState<{phase: string; prev: string} | null>(null);
+  const lastPhaseRef = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const [statusTitle, setStatusTitle] = useState(
@@ -56,6 +60,13 @@ export default function GamePage() {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
     autoScrollRef.current = atBottom;
   };
+
+  // Auto-start human mode when no gameState (direct URL access or refresh)
+  useEffect(() => {
+    if (mode === "human" && !gameState && !isPlaying) {
+      startHumanGame();
+    }
+  }, [mode, roomId]);
 
   // Sync status when gameState arrives (e.g., from lobby pre-start)
   useEffect(() => {
@@ -87,23 +98,72 @@ export default function GamePage() {
     }
   }, [roomId]);
 
+  useEffect(() => {
+    if (mode !== "human") {
+      setViewMode(ViewMode.MODERATOR);
+    }
+  }, [mode, setViewMode]);
+
+  // Auto-start the game on first entry in AI mode.
+  //
+  // The lobby calls /api/rooms/{id}/prepare before navigating here, so
+  // gameState already has all players + roles + personas populated when we
+  // mount — we can't use "gameState empty" as the trigger anymore (it never
+  // is). We instead rely on three signals:
+  //   - mode === "ai"
+  //   - the game hasn't already ended (winner set)
+  //   - we haven't already opened a WebSocket for this room
+  //
+  // We DON'T mark `autoStartedRef = true` until the setTimeout actually fires,
+  // because React 18 Strict Mode (dev) double-mounts: the first mount sets the
+  // ref and schedules the timer, the cleanup clears the timer, then the
+  // second mount sees ref=true and bails — so nothing ever starts. By only
+  // setting the ref inside the timer callback, the cleanup cancels the
+  // first attempt cleanly and the second mount re-schedules.
+  const autoStartedRef = useRef(false);
+  useEffect(() => {
+    if (autoStartedRef.current) return;
+    if (mode !== "ai") return;
+    if (gameState?.winner) return;
+    if (isPlaying) return;
+    if (wsRef.current) return;
+    // Small delay so the WS handler is attached and AppContext is settled.
+    const id = setTimeout(() => {
+      autoStartedRef.current = true;
+      runGame();
+    }, 200);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, roomId]);
+
   function runGame() {
     if (mode === "human") { startHumanGame(); return; }
     if (wsRef.current) wsRef.current.close();
     setIsPlaying(true);
     setStatusTitle(t("statusStreaming", language));
-    setGameState(null);
+    // Don't wipe gameState if /prepare already populated the roster — it
+    // would flash empty placeholders for the 100-300ms before the WS replays
+    // baseline frames. Only clear when this is a fresh "run again" click.
+    if (gameState?.winner) setGameState(null);
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws/rooms/${roomId}`);
     wsRef.current = ws;
     ws.onopen = () => ws.send(JSON.stringify({
       action: "start", seed, agent_type: agentType,
-      show_private: viewMode === ViewMode.MODERATOR, delay_ms: speed,
+      show_private: true, delay_ms: speed,  // Always request full data; frontend filters by viewMode
     } as WebSocketRequest));
     ws.onmessage = (e) => {
       const msg: WebSocketMessage = JSON.parse(e.data);
       if (msg.type === "room" && msg.room) setRoom(msg.room);
-      if (msg.type === "snapshot" && msg.state) setGameState(msg.state);
+      if (msg.type === "snapshot" && msg.state) {
+        setGameState(msg.state);
+        // Detect phase changes for announcement
+        const newPhase = msg.state.phase;
+        if (newPhase && newPhase !== lastPhaseRef.current) {
+          setAnnouncePhase({ phase: newPhase, prev: lastPhaseRef.current });
+          lastPhaseRef.current = newPhase;
+        }
+      }
       if (msg.type === "complete") {
         if (msg.state) setGameState(msg.state);
         if (msg.room) setRoom(msg.room);
@@ -112,7 +172,23 @@ export default function GamePage() {
       if (msg.type === "error") { setIsPlaying(false); setStatusTitle(t("statusError", language)); }
     };
     ws.onerror = () => setIsPlaying(false);
-    ws.onclose = () => setIsPlaying(false);
+    ws.onclose = (ev) => {
+      setIsPlaying(false);
+      // Auto-reconnect when the socket dies mid-game (network blip, server
+      // hiccup, browser pausing tabs). The backend keeps the game running and
+      // buffers snapshots, so the reconnect picks up where we left off.
+      // We skip reconnect when: (a) the game already finished, (b) we hold
+      // the most recent gameState that includes a winner, or (c) we
+      // intentionally closed the socket because the user navigated away.
+      const finished = gameState?.winner != null;
+      const cleanClose = ev.code === 1000 || ev.code === 1001;
+      if (!finished && !cleanClose && wsRef.current === ws) {
+        setStatusTitle(language === "zh" ? "连接断开，自动重连..." : "Reconnecting…");
+        setTimeout(() => {
+          if (wsRef.current === ws) runGame();
+        }, 800);
+      }
+    };
   }
 
   async function startHumanGame() {
@@ -150,9 +226,21 @@ export default function GamePage() {
   const splitPoint = useMemo(() => Math.ceil((gameState?.players?.length || 7) / 2), [gameState?.players?.length]);
   const leftPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat <= splitPoint), [gameState?.players, splitPoint]);
   const rightPlayers = useMemo(() => (gameState?.players || []).filter((p: any) => p.seat > splitPoint), [gameState?.players, splitPoint]);
-  const aliveCount = gameState?.alive_count || gameState?.players?.filter((p: any) => p.alive).length || 0;
+  const aliveCount = gameState?.alive_count ?? (gameState?.players?.filter((p: any) => p.alive).length ?? 0);
   const pendingInput = gameState?.pending_input;
+  // Highlight whoever is currently taking a turn — pendingInput covers human
+  // turns (waiting for input), current_speaker_id covers AI turns being
+  // generated. The PlayerCard uses this flag to glow.
+  const activeSpeakerId = pendingInput?.player_id || gameState?.current_speaker_id || null;
   const isHumanMode = mode === "human";
+
+  // Badge state — exposed so PlayerCard can render the sheriff badge and the
+  // "竞选警长" marker for active candidates during DAY_BADGE_* phases. We
+  // resolve these once per render instead of inside every map() iteration.
+  const sheriffId: string | null = (gameState as any)?.badge?.holder_id || null;
+  const badgeCandidateIds: string[] = Array.isArray((gameState as any)?.badge?.candidates)
+    ? (gameState as any).badge.candidates
+    : [];
 
   // Find human player's role and wolf teammates for PlayerCard own-role display
   const humanPlayer = useMemo(() => (gameState?.players || []).find((p: any) => p.seat === humanSeat), [gameState?.players, humanSeat]);
@@ -170,16 +258,26 @@ export default function GamePage() {
   }
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden"
-      style={{ background: "var(--color-bg)", transition: "background var(--transition-daynight) var(--ease-in-out)" }}>
+    <div className="h-screen flex flex-col overflow-hidden night-stars" data-phase-aware
+      style={{ background: "var(--color-bg)" }}>
+
+      {/* Phase Announcement Overlay */}
+      {announcePhase && (
+        <PhaseAnnouncement
+          phase={announcePhase.phase}
+          prevPhase={announcePhase.prev}
+          onDone={() => setAnnouncePhase(null)}
+        />
+      )}
+
       {isNight && (
         <div className="fixed inset-0 pointer-events-none z-0 transition-opacity duration-800"
           style={{ background: "radial-gradient(ellipse at 50% 0%, rgba(25,25,35,0.25) 0%, rgba(0,0,0,0.55) 100%)", opacity: 1 }} />
       )}
 
       {/* Header */}
-      <header className="relative z-10 flex items-center gap-3 px-4 md:px-6 py-2.5 border-b flex-wrap"
-        style={{ background: "var(--color-card)", borderColor: "var(--color-border)", transition: "background var(--transition-daynight) var(--ease-in-out)" }}>
+      <header className="relative z-10 flex items-center gap-3 px-4 md:px-6 py-2.5 border-b flex-wrap" data-phase-aware
+        style={{ background: "var(--color-card)", borderColor: "var(--color-border)" }}>
         <div className="flex items-center gap-3">
           <span className="font-display text-lg font-semibold text-primary">AI Werewolf</span>
           <span className="text-xs text-text-sub">{t("roomLabel", language)}: {truncate(roomId, 8)}</span>
@@ -216,7 +314,10 @@ export default function GamePage() {
           {(leftPlayers.length > 0 ? leftPlayers : ph(1, Math.ceil((gameState?.players?.length || 7) / 2))).map((p: any, i: number) => (
             <PlayerCard key={p.id || i} player={p}
               isSpeaking={pendingInput?.player_id === p.id}
-              showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+              isThinking={!pendingInput && activeSpeakerId === p.id}
+              isSheriff={sheriffId === p.id}
+              isBadgeCandidate={badgeCandidateIds.includes(p.id)}
+              showOwnRole={isHumanMode && p.seat === humanSeat}
               wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
             />
           ))}
@@ -232,7 +333,7 @@ export default function GamePage() {
           </div>
           <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-3">
             {gameState?.events?.length ? (
-              Object.keys(dayBlocks).sort((a, b) => Number(b) - Number(a)).map((dk) => {
+              Object.keys(dayBlocks).sort((a, b) => Number(a) - Number(b)).map((dk) => {
                 const dayEvents = dayBlocks[Number(dk)];
                 // Find deaths for day header
                 const deaths = dayEvents.filter((e: any) =>
@@ -260,8 +361,7 @@ export default function GamePage() {
                           const iconMap: Record<string, string> = {
                             GAME_START: "\u{1F3AE}", PHASE_CHANGED: "", GAME_END: "\u{1F3C6}", SYSTEM_MESSAGE: "\u{1F4E2}",
                           };
-                          const msg = ev.payload.message || ev.payload.phase
-                            ? tPhase(ev.payload.phase, language) : "";
+                          const msg = ev.payload.message ?? (ev.payload.phase ? tPhase(ev.payload.phase, language) : "");
                           const icon = iconMap[ev.type] || "";
                           return (
                             <ChatBubble
@@ -311,7 +411,10 @@ export default function GamePage() {
           {(rightPlayers.length > 0 ? rightPlayers : ph(splitPoint + 1, gameState?.players?.length || 7)).map((p: any, i: number) => (
             <PlayerCard key={p.id || i} player={p}
               isSpeaking={pendingInput?.player_id === p.id}
-              showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+              isThinking={!pendingInput && activeSpeakerId === p.id}
+              isSheriff={sheriffId === p.id}
+              isBadgeCandidate={badgeCandidateIds.includes(p.id)}
+              showOwnRole={isHumanMode && p.seat === humanSeat}
               wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
             />
           ))}
@@ -322,7 +425,10 @@ export default function GamePage() {
         {((gameState?.players?.length || 0) > 0 ? gameState!.players : ph(1, gameState?.players?.length || 7)).map((p: any, i: number) => (
           <div key={p.id || i} className="flex-shrink-0 w-[100px]"><PlayerCard player={p}
             isSpeaking={pendingInput?.player_id === p.id}
-            showOwnRole={isHumanMode && p.seat === humanSeat && viewMode !== "moderator"}
+            isThinking={!pendingInput && activeSpeakerId === p.id}
+            isSheriff={sheriffId === p.id}
+            isBadgeCandidate={badgeCandidateIds.includes(p.id)}
+            showOwnRole={isHumanMode && p.seat === humanSeat}
             wolfTeammates={isHumanMode && p.seat === humanSeat ? wolfTeammates : undefined}
           /></div>
         ))}
