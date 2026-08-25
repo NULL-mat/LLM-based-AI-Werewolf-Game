@@ -30,7 +30,7 @@ class LLMAgent(Agent):
         provider: str | None = None,
         model: str | None = None,
         temperature: float = 0.4,
-        speech_temperature: float = 1.0,
+        speech_temperature: float = 1.1,
         character: Character | None = None,
     ):
         self.player_id = player_id
@@ -71,9 +71,6 @@ class LLMAgent(Agent):
     def talk(self) -> Decision:
         fallback = self.fallback.talk()
         view = self._view()
-        # Count today's public speeches in the current phase so the first
-        # speaker doesn't fabricate accusations against people who haven't
-        # said anything yet. "前言不搭后语" came from this exact gap.
         today_chat_count = sum(
             1 for e in view.public_events
             if e.get("day") == view.day
@@ -81,86 +78,493 @@ class LLMAgent(Agent):
             and e.get("phase") == view.phase
         )
         is_first_speaker = today_chat_count == 0
-        # Last words are spoken by a just-eliminated player; they don't have a
-        # turn to pass and aren't supposed to invite the next speaker, since
-        # the floor goes back to the moderator after they finish. Without this
-        # branch the LLM kept tacking on "接下来有请@X号:名字 发言" because the
-        # generic speech template encourages floor handoff.
         is_last_words = view.phase == "DAY_LAST_WORDS"
 
-        # Build speak order awareness (wolfcha-style)
-        today_speakers = [
-            self._format_player_tag(self._player_by_id(e.get("actor_id")))
-            for e in view.public_events
-            if e.get("day") == view.day
-            and e.get("type") == "CHAT_MESSAGE"
-            and e.get("phase") == view.phase
-        ]
-        yet_to_speak = [
-            self._format_player_tag(p) for p in view.players
-            if p["alive"] and p["id"] != self.player_id
-            and self._format_player_tag(p) not in today_speakers
-        ]
+        # --- Wolfcha-style system prompt parts ---
+        system_parts = self._build_talk_system_parts(is_last_words)
 
-        speak_order_hint = ""
-        if is_last_words:
-            pass  # handled by instructions below
-        elif is_first_speaker:
-            speak_order_hint = "你是本轮第一个发言的人，没有人已经说过话，你可以先给出初步印象。"
-        elif yet_to_speak:
-            spoken_str = "、".join(today_speakers[-6:]) if today_speakers else "(无人)"
-            pending_str = "、".join(yet_to_speak[:6])
-            speak_order_hint = (
-                f"已有发言：{spoken_str}。尚未发言：{pending_str}。"
-                "你可以回应前人的观点，或补充他们没提到的角度。"
-            )
+        # --- Wolfcha-style game context ---
+        game_context = self._build_game_context()
 
-        # Build perspective hints (wolfcha-style focus angle)
-        perspective_hints = self._build_perspective_hints()
+        # --- Today's transcript ---
+        today_transcript = self._build_today_transcript()
 
-        if is_last_words:
-            instructions = [
-                "你已经出局，现在是你的遗言时间——这是你最后一次开口的机会，结束后场上不会再有发言权。",
-                "禁止使用「接下来有请」「请下一位」等任何传递话筒的句式；你没有下一位可以传。",
-                "可以做的事：交代自己的真实身份/阵营、留下查杀或站边信息、点出最可疑的玩家、给好人提建议。",
-                "保持角色风格，2-3 句话即可。",
-            ]
-        elif is_first_speaker:
-            instructions = [
-                "你是本阶段第一个发言的人——目前还没有任何人开口，你也没有任何可以引用的发言或投票。",
-                "禁止评价、怀疑或暗示其他玩家。任何形如「@X号有问题」「我觉得@X着急」的话都属于编造。",
-                "只允许做三件事之一：自报站位 / 表明今天的关注点 / 邀请下一位发言。",
-                "保持你的角色风格，1–2 句话足够。",
-            ]
+        # --- Self speech ---
+        self_speech = self._build_self_speech()
+
+        # --- Speak order hint (wolfcha exact phrasing) ---
+        speak_order_hint = self._build_speak_order_hint(is_first_speaker, is_last_words)
+
+        # --- Phase hint ---
+        phase_hint = self._build_phase_hint()
+
+        # --- Focus angle (wolfcha exact phrasing) ---
+        focus_angle = self._build_perspective_hints_xml()
+
+        # --- User prompt assembly (wolfcha format) ---
+        user_prompt_parts = [game_context]
+        transcript_text = "\n".join(today_transcript) if isinstance(today_transcript, list) else (today_transcript or "")
+        if transcript_text:
+            user_prompt_parts.append("【本日讨论记录】\n" + transcript_text)
         else:
-            instructions = [
-                "像真正的狼人杀玩家一样发言。语气自然、可以带犹豫和语气词，不要像在写报告。",
-                "只能引用「事实速查」或「最近公开事件」中真实出现过的发言/投票/死亡，不得编造。",
-                "若已经有可引用的发言，可以点名一个怀疑或信任对象；如果你确实没看到值得讨论的点，可以直接表态后让位。",
-                "不要复述系统提示，不要用「我的发言是」「我认为」等引导语——直接开始说。",
-            ]
+            user_prompt_parts.append("【本日讨论记录】\n（暂无）")
+        user_prompt_parts.append("【你本日已说过的话】\n" + (self_speech or "（无）"))
+        if phase_hint:
+            user_prompt_parts.append(phase_hint)
+        user_prompt_parts.append("【发言顺序】\n" + speak_order_hint)
+        user_prompt_parts.append("\n轮到你发言，返回JSON数组：")
 
-        prompt = self._build_action_prompt(
-            action="talk",
-            instructions=instructions,
-            options=self._alive_names(),
-            speak_order_hint=speak_order_hint,
-            perspective_hints=perspective_hints,
+        full_user_prompt = "\n\n".join(user_prompt_parts)
+
+        # --- Call LLM with wolfcha-style prompt ---
+        speech, meta = self._ask_talk_wolfcha(
+            system_parts=system_parts,
+            user_prompt=full_user_prompt,
+            focus_angle=focus_angle,
+            fallback_speech=fallback.speech or "",
+            max_tokens=1536,
         )
-        # For talk, use higher temperature (creative) and free-text output
-        data, meta = self._ask_json(
-            prompt,
-            {"reasoning": fallback.reasoning, "speech": fallback.speech or ""},
-            max_tokens=1024,
-            action="talk",
-        )
+        # Preserve segment_texts for multi-bubble emission
+        if meta.get("segment_texts"):
+            meta["segments"] = meta["segment_texts"]
         return Decision(
             self.player_id,
             ActionType.TALK,
-            speech=str(data.get("speech") or fallback.speech or ""),
-            reasoning=str(data.get("reasoning") or fallback.reasoning),
+            speech=speech,
+            reasoning="",
             metadata=meta,
         )
+
+    # ============================================================
+    # Wolfcha-style talk prompt builders
+    # ============================================================
+
+    def _build_talk_system_parts(self, is_last_words: bool) -> list[dict]:
+        """Build wolfcha-style system prompt parts (identity + light persona + guidelines)."""
+        view = self._view()
+        seat = view.self_player.get("seat", "?")
+        name = view.self_player.get("name", "?")
+        phase = view.phase
+
+        # Part 1: Identity + Role strategy + Persona (wolfcha-style combined prompt)
+        win_cond = self._build_win_condition()
+        persona_hint = self._build_persona_hint()
+        base = (
+            f"你是 {seat}号「{name}」，身份: {self.role.value}。\n\n"
+            f"{win_cond}\n\n"
+            f"{persona_hint}"
+        )
+
+        # Part 2: Task section (varies by phase)
+        if is_last_words:
+            task_line = "你已经出局，现在发表遗言——交代身份、留下信息、点出最可疑的人。"
+        elif "BADGE" in str(phase):
+            task_line = (
+                "现在是警徽竞选发言。你不是来点评别人的——你是来争取警徽的。"
+                "说明你为什么想拿警徽、你此刻更想看谁、你能不能带队。"
+                "像桌上一名真实玩家那样说出你此刻想争取的东西，不需要像演讲稿。"
+            )
+        else:
+            task_line = (
+                "现在是白天自由发言。你不是在做总结报告——你是桌子上的玩家。"
+                "从上一个发言者的观点切入，认同、质疑、补充都可以。"
+                "不需要面面俱到，只说此刻你最在意的一点。"
+            )
+        task = (
+            "【当前处境】\n"
+            "你正在参与一局实时狼人杀。你不是旁观解说，也不是裁判。\n"
+            f"现在轮到你发言。{task_line}"
+        )
+
+        # Part 3: Lightweight behavior hint
+        behavior_hint = self._build_behavior_hint()
+
+        # Part 4: Guidelines
+        guidelines = (
+            "【底线规则】\n"
+            "- 只基于本局实际信息发言，严禁编造。\n"
+            "- 用「X号」称呼玩家。\n"
+            "- 绝对不要说「请X号发言」「过」「下一位」「接下来有请」——你不是主持人！\n"
+            "- 严禁职业相关类比、行业术语和场外经历。\n"
+            "\n"
+            "【发言方式】\n"
+            "从上一人的观点切入——回应他说的内容，然后自然过渡到你自己的判断。\n"
+            "不需要总结全场、不需要逐一点评每个玩家。\n"
+            "不需要每次都说「我是X号玩家」开头。\n"
+            "可以分成 2-3 条消息气泡，每条 1-2 句完整的思考。\n"
+            "语气像真人聊天，可以有语气词、停顿、反问。\n"
+            "\n"
+            "【输出格式】\n"
+            "返回 JSON 字符串数组，每个元素是一条消息气泡。"
+        )
+
+        parts = [
+            {"text": base, "cacheable": True},
+        ]
+        if behavior_hint:
+            parts.append({"text": behavior_hint, "cacheable": True})
+        parts.append({"text": task, "cacheable": False})
+        parts.append({"text": guidelines, "cacheable": True})
+        return parts
+
+    def _build_behavior_hint(self) -> str:
+        """Behavior traits that make this character play differently from others."""
+        if not self.character:
+            return ""
+        p = self.character.persona
+        m = self.character.mind
+
+        # Map cognitive values to natural Chinese behavioral descriptions
+        courage_map = {
+            "bold": "你不怕站边、敢带节奏",
+            "cautious": "你比较谨慎，不会第一个冲票",
+            "calculated": "你有把握时才明确表态",
+        }
+        suspicion_map = {
+            "low": "你比较容易起疑，小破绽就能让你锁定目标",
+            "medium": "你需要看到连续的可疑行为才会下判断",
+            "high": "你倾向于先相信别人的解释",
+        }
+        logic_map = {
+            "shallow": "你凭直觉做判断，不太深究逻辑链条",
+            "moderate": "你会盘基本逻辑，但不钻牛角尖",
+            "deep": "你喜欢多角度分析，会反复推敲每个细节",
+        }
+        table_map = {
+            "dominant": "你喜欢主导讨论节奏",
+            "balanced": "你在场上既会表达也会倾听",
+            "quiet": "你话不多，但发言往往切中要害",
+        }
+
+        lines = ["<hidden_traits>"]
+        lines.append(f"发言特点：{p.speech_length_habit or '自然长度'}")
+        lines.append(f"压力下的反应：{p.pressure_style or '冷静回应'}")
+        lines.append(f"推理深度：{logic_map.get(m.logic_depth, '中等')}")
+        lines.append(f"态度：{courage_map.get(m.courage, '看情况表态')}")
+        lines.append(f"对他人的信任度：{suspicion_map.get(m.suspicion_threshold, '中等')}")
+        lines.append(f"桌面风格：{table_map.get(m.table_presence, '随和')}")
+        if p.wolf_deception_style and self.role.value.lower() in ("werewolf", "white_wolf_king"):
+            lines.append(f"拿狼时的打法：{p.wolf_deception_style}")
+        if p.mistake_pattern:
+            lines.append(f"你的一个弱点：{p.mistake_pattern}")
+
+        # Round-to-round variation
+        moods = [
+            "这轮可以轻松一点",
+            "这轮直接说重点",
+            "这轮先回应前一个人再表态",
+            "这轮从一个具体的观察切入",
+        ]
+        lines.append(moods[self.rng.randint(0, len(moods) - 1)])
+
+        lines.append("以上是你的内在特质——发言时自然流露，不要背诵。</hidden_traits>")
+        return "\n".join(lines)
+
+    def _build_persona_hint(self) -> str:
+        """Character identity — narrative, not bullet points."""
+        if not self.character:
+            return ""
+        p = self.character.persona
+        # Use the pre-built narrative system_prompt for rich identity
+        if p.system_prompt:
+            return (
+                "【你的角色】\n"
+                + p.system_prompt
+                + "\n\n以上是你的角色设定。这是你的底色——自然内化，不要在发言中逐字复述。"
+            )
+        # Fallback: build a minimal identity
+        lines = [f"你是{p.name}，{p.age}岁{p.gender}。{p.basic_info or ''}"]
+        if p.vocabulary_style:
+            lines.append(f"说话风格：{p.vocabulary_style}")
+        if p.reasoning_style:
+            lines.append(f"思考方式：{p.reasoning_style}")
+        return "【你的角色】\n" + "\n".join(lines)
+
+    def _build_game_context(self) -> str:
+        """Build wolfcha-style YAML game context."""
+        view = self._view()
+        seat = view.self_player.get("seat", "?")
+        name = view.self_player.get("name", "?")
+        total_seats = len(view.players)
+        day = view.day
+
+        # Phase text
+        phase_map = {
+            "DAY_SPEECH": "白天 自由发言",
+            "DAY_LAST_WORDS": "白天 遗言",
+            "DAY_BADGE_SPEECH": "白天 警徽竞选发言",
+            "DAY_PK_SPEECH": "白天 警徽PK发言",
+            "NIGHT_START": "夜晚",
+        }
+        phase_text = phase_map.get(view.phase, view.phase)
+
+        # Alive players list
+        alive_players = [p for p in view.players if p["alive"]]
+        alive_lines = [f"  {p.get('seat', '?')}号 {p.get('name', '?')}" for p in alive_players]
+        alive_list = "\n".join(alive_lines)
+
+        # Dead players list
+        dead_players = [p for p in view.players if not p["alive"]]
+        dead_lines = []
+        for p in dead_players:
+            dead_seat = p.get("seat", "?")
+            dead_name = p.get("name", "?")
+            # Try to find death cause from events
+            cause = "死亡"
+            for e in view.public_events:
+                if e.get("type") == "PLAYER_DIED":
+                    payload = e.get("payload", {}) or {}
+                    if payload.get("player_id") == p["id"]:
+                        reason = payload.get("reason", "")
+                        if "vote" in reason.lower() or "投票" in reason:
+                            cause = "投票处决"
+                        elif "wolf" in reason.lower() or "狼" in reason:
+                            cause = "狼人杀死"
+                        elif "poison" in reason.lower() or "毒" in reason:
+                            cause = "女巫毒死"
+                        elif "hunter" in reason.lower() or "猎人" in reason:
+                            cause = "猎人开枪"
+                        break
+            dead_lines.append(f"  {dead_seat}号 {dead_name} ({cause})")
+        dead_info = "\n".join(dead_lines) if dead_lines else "无"
+
+        # Sheriff
+        sheriff_seat = None
+        for p in view.players:
+            if p.get("badge") or p.get("is_sheriff"):
+                sheriff_seat = p.get("seat")
+                break
+        sheriff_info = f"{sheriff_seat}号" if sheriff_seat else "无"
+
+        # Rules section
+        rules = (
+            "【规则提醒】\n"
+            "- 阶段顺序：夜晚（狼人刀人）→ 天亮公布死亡 → 自由发言 → 投票。\n"
+            "- 狼人出刀可选择队友或自己（允许自刀），后续判断请考虑此可能。\n"
+            "- 时间线提醒：昨夜刀口在今天白天开始前已锁定；不要把今天的发言当作昨夜被刀的原因。\n"
+            "\n"
+            "【各阶段信息可用性——推理时请牢记】\n"
+            "- 第一夜（第0夜→第1天）：狼人刀人时没有任何信息（不知道谁是预言家/女巫/守卫），刀口是随机的。预言家第一夜查验也是盲查。所有人第一天白天开始时信息量极少，怀疑应该比较弱。\n"
+            "- 第二夜起：狼人可以根据白天发言选择刀口；预言家可以根据白天发言选择查验目标；女巫可以根据白天信息决定用药。\n"
+            "- 白天发言阶段：你只能看到公开的发言和投票结果，看不到其他人的角色和夜间行动。\n"
+            "- 遗言：被投票放逐的玩家可以发表遗言，被狼人杀死的玩家通常不能遗言。"
+        )
+
+        # History: past transcripts (simplified from events)
+        history_lines = ["【历史】"]
+        past_days = set()
+        for e in view.public_events:
+            eday = e.get("day", 0)
+            if eday < day and eday not in past_days and e.get("type") == "CHAT_MESSAGE":
+                past_days.add(eday)
+                payload = e.get("payload", {}) or {}
+                speech = (payload.get("speech") or "")[:80]
+                if speech:
+                    history_lines.append(f"  第{eday}天 {payload.get('actor_name', '?')}：{speech}")
+        for e in view.public_events:
+            eday = e.get("day", 0)
+            if eday < day and e.get("type") == "PLAYER_DIED":
+                payload = e.get("payload", {}) or {}
+                history_lines.append(f"  第{eday}天 {payload.get('player_name', '?')} 出局")
+
+        # Vote history
+        vote_lines = ["【历史投票】"]
+        votes_by_day: dict[int, list[str]] = {}
+        for e in view.public_events:
+            if e.get("type") == "VOTE_CAST":
+                eday = e.get("day", 0)
+                if eday < day:
+                    payload = e.get("payload", {}) or {}
+                    voter = payload.get("voter_name", "?")
+                    target = payload.get("target_name", "?")
+                    votes_by_day.setdefault(eday, []).append(f"{voter}→{target}")
+        for vday, votes in sorted(votes_by_day.items()):
+            vote_lines.append(f"  第{vday}天投票: {'; '.join(votes[-10:])}")
+
+        # Role-specific private info
+        role_info = self._build_role_private_info()
+
+        # Assemble context
+        context = (
+            f"【当前局势】\n"
+            f"第{day}天 {phase_text}\n"
+            f"有效座位号范围: 1号-{total_seats}号（共{total_seats}人）\n"
+            f"存活玩家:\n{alive_list}\n"
+            f"\n"
+            f"【出局玩家】\n{dead_info}\n"
+            f"\n"
+            f"警长: {sheriff_info}\n"
+        )
+        if role_info:
+            context += f"\n{role_info}\n"
+        context += f"\n{rules}\n"
+
+        if len(history_lines) > 1:
+            context += "\n" + "\n".join(history_lines)
+        if len(vote_lines) > 1:
+            context += "\n" + "\n".join(vote_lines)
+
+        context += "\n【提醒】发言重点放在存活玩家，可引用死亡原因作为推理依据，但不要过度复盘已出局玩家。"
+
+        return context
+
+    def _build_role_private_info(self) -> str:
+        """Build role-specific private info section."""
+        view = self._view()
+        private = view.private_events
+        if not private:
+            return ""
+        # Seer checks
+        seer_checks = []
+        for e in private:
+            if e.get("type") == "SEER_CHECK":
+                payload = e.get("payload", {}) or {}
+                eday = e.get("day", 0)
+                target = payload.get("target_name", "?")
+                result = "狼人" if payload.get("is_wolf") else "好人"
+                seer_checks.append(f"第{eday}夜: {target} - {result}")
+        if seer_checks:
+            return "【查验记录】\n" + "\n".join(seer_checks)
+        # Witch potions
+        if any(e.get("type") in ("WITCH_SAVE", "WITCH_POISON") for e in private):
+            lines = ["【药水状态】"]
+            save_used = any(e.get("type") == "WITCH_SAVE" for e in private)
+            poison_used = any(e.get("type") == "WITCH_POISON" for e in private)
+            lines.append(f"解药: {'已使用' if save_used else '可用'}")
+            lines.append(f"毒药: {'已使用' if poison_used else '可用'}")
+            for e in private:
+                if e.get("type") == "WITCH_SAVE":
+                    lines.append(f"你用解药救了 {e.get('payload', {}).get('target_name', '?')}")
+                if e.get("type") == "WITCH_POISON":
+                    lines.append(f"你用毒药毒了 {e.get('payload', {}).get('target_name', '?')}")
+            return "\n".join(lines)
+        return ""
+
+    def _build_win_condition(self) -> str:
+        """Wolfcha-style win condition + role strategy combined."""
+        role = self.role.value.lower()
+        win_map = {
+            "werewolf": "【你的阵营】狼人。狼人数量 >= 好人数量时胜利。你知道狼队友是谁，白天伪装好人，夜晚和队友协调刀人。",
+            "white_wolf_king": "【你的阵营】白狼王。狼人数量 >= 好人数量时胜利。你白天可自爆带走一名玩家。",
+            "seer": "【你的阵营】预言家。放逐所有狼人时好人胜利。每晚查验一人，结果只有你知道。",
+            "witch": "【你的阵营】女巫。放逐所有狼人时好人胜利。有一瓶解药和一瓶毒药，各限一次。",
+            "hunter": "【你的阵营】猎人。放逐所有狼人时好人胜利。死亡时可开枪带走一人（被毒杀除外）。",
+            "guard": "【你的阵营】守卫。放逐所有狼人时好人胜利。每晚守护一人，不能连守同一人。",
+            "villager": "【你的阵营】村民。放逐所有狼人时好人胜利。没有特殊能力，靠推理和投票。",
+            "idiot": "【你的阵营】白痴。放逐所有狼人时好人胜利。被投票放逐时翻牌免疫，之后失去投票权。",
+        }
+        base = win_map.get(role, "【你的阵营】好人。放逐所有狼人时胜利。")
+
+        # Add role-specific talk strategy from prompts.py
+        from backend.agents.prompts import get_action_strategy
+        strategy = get_action_strategy("talk", self.role)
+        if strategy:
+            base += f"\n\n【你的玩法】{strategy}"
+        return base
+
+    def _build_persona_section(self) -> str:
+        """Wolfcha-style persona section."""
+        if not self.character:
+            return ""
+        p = self.character.persona
+        m = self.character.mind
+        risk_label = "激进型，喜欢主动质疑" if m.courage == "bold" else ("保守型，喜欢观察" if m.courage == "cautious" else "平衡型")
+        voice_rules = ", ".join(p.voice_rules[:3]) if p.voice_rules else p.vocabulary_style
+        section = f"【角色设定】\n说话习惯: {voice_rules}\n风格: {risk_label}"
+        if p.basic_info:
+            section += f"\n背景: {p.basic_info}"
+        return section
+
+    def _build_self_speech(self) -> str:
+        """Build self-speech reference section."""
+        view = self._view()
+        my_speeches = []
+        for e in view.public_events:
+            if (e.get("day") == view.day
+                and e.get("type") == "CHAT_MESSAGE"
+                and e.get("actor_id") == self.player_id):
+                speech = (e.get("payload", {}).get("speech") or "").strip()
+                if speech:
+                    my_speeches.append(speech)
+        if not my_speeches:
+            return ""
+        return "\n".join(f"  · {s[:120]}" for s in my_speeches[-3:])
+
+    def _build_speak_order_hint(self, is_first: bool, is_last: bool) -> str:
+        """Build wolfcha-style speak order hint with 'respond to last speaker' guidance."""
+        view = self._view()
+        if is_last:
+            today_speakers = set()
+            for e in view.public_events:
+                if e.get("day") == view.day and e.get("type") == "CHAT_MESSAGE" and e.get("phase") == view.phase:
+                    today_speakers.add(e.get("actor_id", ""))
+            total = len(today_speakers) + 1
+            return (
+                f"你是最后一个发言（第{total}/{total}个），所有人都已经发言完毕。"
+                "不要说「等X号发言」或「看X号接下来怎么说」。"
+            )
+
+        # Get today's speakers in order with their speeches
+        today_spoken = []
+        last_speaker = None
+        last_speech = ""
+        for e in view.public_events:
+            if e.get("day") == view.day and e.get("type") == "CHAT_MESSAGE" and e.get("phase") == view.phase:
+                actor_id = e.get("actor_id", "")
+                p = self._player_by_id(actor_id)
+                if p:
+                    tag = self._format_player_tag(p)
+                    if tag not in [s[0] for s in today_spoken]:
+                        payload = e.get("payload", {}) or {}
+                        speech = str(payload.get("speech", ""))[:80]
+                        today_spoken.append((tag, speech))
+                        last_speaker = tag
+                        last_speech = speech
+
+        yet_to_speak = []
+        for p in view.players:
+            if p["alive"] and p["id"] != self.player_id:
+                tag = self._format_player_tag(p)
+                if tag not in [s[0] for s in today_spoken]:
+                    yet_to_speak.append(tag)
+
+        my_pos = len(today_spoken) + 1
+        total = my_pos + len(yet_to_speak)
+
+        if is_first or not today_spoken:
+            return "你是第1个发言，其他人都还没发言。"
+
+        spoken_list = "、".join(s[0] for s in today_spoken[-8:])
+        unspoken_list = "、".join(yet_to_speak[:8])
+
+        hint = f"你是第{my_pos}/{total}个发言。已发言: {spoken_list}；未发言: {unspoken_list}。"
+        # Add "respond to last speaker" guidance
+        if last_speaker:
+            hint += (
+                f"\n上一个发言的是{last_speaker}，他说：「{last_speech}」。"
+                "你可以从回应他的观点开始——认同、质疑、补充都可以。"
+            )
+        return hint
+
+    def _build_phase_hint(self) -> str:
+        """Build phase hint section."""
+        view = self._view()
+        phase_map = {
+            "DAY_BADGE_SPEECH": "你正在进行警徽竞选发言。",
+            "DAY_PK_SPEECH": "你正在进行警徽PK发言。",
+            "DAY_LAST_WORDS": "你正在发表遗言。",
+        }
+        hint = phase_map.get(view.phase, "")
+        if not hint:
+            return ""
+        return f"【当前环节】\n{hint}"
+
+    def _build_perspective_hints_xml(self) -> str:
+        """Build wolfcha-style focus angle XML block."""
+        hints_text = self._build_perspective_hints()
+        if not hints_text:
+            return ""
+        return f"<focus_angle>\n【你的视角】\n{hints_text}\n</focus_angle>"
 
     def vote(self) -> Decision:
         fallback = self.fallback.vote()
@@ -530,17 +934,17 @@ class LLMAgent(Agent):
         return lines
 
     def _build_perspective_hints(self) -> str:
-        """Generate unique analytical angles for each player (wolfcha-style focus angle).
+        """Generate game-state-aware focus angles (wolfcha-style).
 
-        Returns a string with 1-2 specific hints so every player doesn't say the
-        same thing. Uses seat number and day as seeds for deterministic variation.
+        Each player gets a unique perspective based on: mentions, seat neighbors,
+        sheriff status, voting patterns, and speak order position.
         """
         view = self._view()
         seat = int(view.self_player.get("seat", 0))
         day = view.day
         hints: list[str] = []
 
-        # Check if this player was mentioned by others
+        # 1. Check if mentioned by others today (highest priority)
         for e in view.public_events:
             if e.get("type") == "CHAT_MESSAGE" and e.get("day") == day:
                 payload = e.get("payload", {}) or {}
@@ -549,34 +953,69 @@ class LLMAgent(Agent):
                     mentioner_id = e.get("actor_id") or ""
                     mentioner = self._player_by_id(mentioner_id)
                     if mentioner:
-                        hints.append(f"玩家 {self._format_player_tag(mentioner)} 提到了你，可以考虑回应。")
+                        who = self._format_player_tag(mentioner)
+                        hints.append(f"你被{who}点名提到了，可以考虑回应")
                     break
 
-        # Adjacent to dead player
+        # 2. Adjacent to dead player
+        total = len(view.players)
         dead_seats = [int(p.get("seat", -1)) for p in view.players if not p["alive"]]
-        if any(abs(seat - ds) == 1 or abs(seat - ds) == len(view.players) - 1 for ds in dead_seats if ds > 0):
-            hints.append("你坐在一位已出局玩家的旁边，可以评论这个位置的局势。")
+        for ds in dead_seats:
+            if ds > 0 and (abs(seat - ds) == 1 or abs(seat - ds) == total - 1):
+                dead_player = next((p for p in view.players if int(p.get("seat", -1)) == ds), None)
+                if dead_player:
+                    hints.append(f"你和出局的{self._format_player_tag(dead_player)}座位相邻，可以从这个角度聊一句")
+                else:
+                    hints.append("你和出局的玩家座位相邻，可以从这个角度聊一句")
+                break
 
-        # Sheriff angle
-        is_sheriff = view.self_player.get("is_sheriff", False) or view.self_player.get("badge")
+        # 3. Sheriff angle (more specific)
+        is_sheriff = view.self_player.get("is_sheriff") or view.self_player.get("badge")
         if is_sheriff:
-            hints.append("你是警长，发言有影响力。可以给归票方向。")
-        elif seat % 2 == view.day % 2:
-            hints.append("关注警长的归票，看是否合理。")
+            hints.append("你是警长，你的发言会影响别人，可以自然给出你的方向")
         else:
-            hints.append("警长的发言是否让你信服？可以表态。")
+            # Alternate: respond to sheriff vs question sheriff
+            if (seat + day) % 2 == 0:
+                hints.append("可以回应一下警长的方向，说明你是否认同")
+            else:
+                hints.append("如果你不认同警长，可以自然提出疑问")
 
-        # Voting pattern (day 2+)
+        # 4. Voting alignment (day 2+)
         if day >= 2:
-            hints.append(f"回顾昨天的投票和发言，看有没有人前后不一致。")
+            my_votes = []
+            for e in view.public_events:
+                if e.get("type") == "VOTE_CAST" and e.get("day") == day - 1:
+                    payload = e.get("payload", {}) or {}
+                    if payload.get("voter_id") == self.player_id:
+                        my_votes.append(payload.get("target_id", ""))
+            if my_votes:
+                # Find who voted the same way
+                same_voters = []
+                for e in view.public_events:
+                    if e.get("type") == "VOTE_CAST" and e.get("day") == day - 1:
+                        payload = e.get("payload", {}) or {}
+                        if payload.get("target_id") in my_votes and payload.get("voter_id") != self.player_id:
+                            v = self._player_by_id(payload.get("voter_id", ""))
+                            if v:
+                                same_voters.append(self._format_player_tag(v))
+                if same_voters:
+                    names = "、".join(same_voters[:3])
+                    hints.append(f"昨天{names}和你投了同一个目标，可以想想这件事要不要提")
 
-        # Select at most 2 hints deterministically
-        selected = []
-        for i, h in enumerate(hints):
-            if (seat + day + i) % len(hints) < 2:
-                selected.append(h)
+        # 5. Speak position (determined by counting today's speakers)
+        today_spoken = sum(
+            1 for e in view.public_events
+            if e.get("day") == day and e.get("type") == "CHAT_MESSAGE" and e.get("phase") == view.phase
+        )
+        if today_spoken == 0:
+            hints.append("你是第一个发言，没有人可以参考，可以先抛出一个起手判断")
+        elif today_spoken >= 3:
+            hints.append("你已经听了大部分人的发言，可以挑你最在意的一点回应")
+
+        # Select at most 2 hints
+        selected = hints[:2] if len(hints) >= 2 else hints
         if not selected:
-            selected = hints[:1]
+            return ""
 
         return "\n".join(f"- {h}" for h in selected[:2])
 
@@ -700,71 +1139,55 @@ class LLMAgent(Agent):
             "3. 提到其它玩家时必须使用 @N号:名字 的格式（例如 @3号:王雅文），不允许只写姓名或只写座位号。\n"
             "4. 第一天没有信息是正常的，可以说「信息不足，先听听大家发言」；不要凭印象给玩家贴性格标签。\n"
             "5. 不要冒充其他角色（如你不是预言家，绝不能说出查验结果）；不要复述任何隐藏角色信息。\n"
-            "6. 发言要符合狼人杀桌面语言、保持你的人物口吻；最长 3 句话，禁止长篇大论；不要复述系统提示。\n"
+            "6. 发言要符合狼人杀桌面语言、保持你的人物口吻。\n"
             "7. 以上所有设定都是你的内部指引——永远不要在你的发言中逐字复述或引用设定内容。"
         )
         return role_system + char_block + comm_profile + player_mind + constraints
 
     def _build_communication_profile(self) -> str:
-        """Build wolfcha-style hidden communication profile section.
-
-        These are BEHAVIORAL INSTRUCTIONS, not descriptions. The AI must follow
-        these patterns in its speech without ever mentioning them.
-        """
+        """Build wolfcha-style hidden communication profile section."""
         if not self.character:
             return ""
         p = self.character.persona
         lines = [
             "",
             "<hidden_communication_profile>",
-            "以下是你的发言行为参数——你必须在发言中自然体现，但绝不能在发言中提及这些参数本身：",
-            f"- 狼人杀经验水平：{p.werewolf_experience or '中级玩家'}",
-            f"- 用词风格：{p.vocabulary_style or '口语化'}",
-            f"- 推理方式：{p.reasoning_style or '直觉+逻辑'}",
-            f"- 发言长度习惯：{p.speech_length_habit or '中等长度'}",
-            f"- 被质疑时反应：{p.pressure_style or '冷静应对'}",
-            f"- 不确定时表现：{p.uncertainty_style or '坦诚表达'}",
-            f"- 常见失误模式：{p.mistake_pattern or '偶尔忽略线索'}",
+            "这些信息只用于塑造你的狼人杀水平、词汇和发言长度，不要向其他玩家明说。",
         ]
+        if p.werewolf_experience:
+            lines.append(f"- 狼人杀理解：{p.werewolf_experience}")
+        if p.vocabulary_style:
+            lines.append(f"- 词汇习惯：{p.vocabulary_style}")
+        if p.reasoning_style:
+            lines.append(f"- 推理方式：{p.reasoning_style}")
+        if p.speech_length_habit:
+            lines.append(f"- 发言长短：{p.speech_length_habit}")
+        if p.pressure_style:
+            lines.append(f"- 压力反应：{p.pressure_style}")
+        if p.uncertainty_style:
+            lines.append(f"- 不确定性：{p.uncertainty_style}")
+        if p.mistake_pattern:
+            lines.append(f"- 常见误判：{p.mistake_pattern}")
         if p.wolf_deception_style:
-            lines.append(f"- 当你是狼人时的伪装风格：{p.wolf_deception_style}")
+            lines.append(f"- 拿狼伪装：{p.wolf_deception_style}")
         lines.append("</hidden_communication_profile>")
         return "\n".join(lines)
 
     def _build_player_mind_section(self) -> str:
-        """Build wolfcha-style hidden player mind section.
-
-        These create stable cognitive biases that affect decision-making
-        but must never be explicitly stated in character speech.
-        """
+        """Build wolfcha-style hidden player mind section."""
         if not self.character:
             return ""
         m = self.character.mind
-        courage_map = {
-            "bold": "敢正面质疑他人，不畏惧对立",
-            "cautious": "谨慎站边，为避免过早暴露立场而保持模糊",
-            "calculated": "只在把握较大时才明确表态",
-        }
-        memory_map = {
-            "first_impression": "第一印象对你影响很大，后面很难改观",
-            "recent": "最近发生的事情对你影响最大，容易忘记前几天的事",
-            "selective": "你只记住与你观点一致的事，忽略反例",
-            "comprehensive": "你能记住大部分关键事件",
-        }
-        suspicion_map = {
-            "low": "你很容易怀疑别人，一点破绽就能让你锁定目标",
-            "medium": "你需要观察到连续可疑行为才会怀疑",
-            "high": "你倾向于相信别人，除非证据确凿",
-        }
+        courage_labels = {"bold": "bold", "cautious": "cautious", "calculated": "calculated"}
         lines = [
             "",
             "<hidden_player_mind>",
-            "以下是你的认知风格参数——它们影响你如何分析和决策，但绝不能在发言中提及：",
-            f"- 勇气程度：{courage_map.get(m.courage, m.courage)}",
-            f"- 记忆倾向：{memory_map.get(m.memory_bias, m.memory_bias)}",
-            f"- 怀疑阈值：{suspicion_map.get(m.suspicion_threshold, m.suspicion_threshold)}",
-            f"- 自我保护倾向：{m.self_protection}",
-            f"- 分析深度：{m.logic_depth}",
+            "这些信息是你稳定的玩家心智，只用于塑造你如何判断、站边、改口、承压和发言，不要向其他玩家明说。",
+            f"- 胆量：{m.courage}",
+            f"- 记忆偏好：{m.memory_bias}",
+            f"- 怀疑阈值：{m.suspicion_threshold}",
+            f"- 自保倾向：{m.self_protection}",
+            f"- 逻辑水平：{m.logic_depth}",
             f"- 桌面存在感：{m.table_presence}",
             "</hidden_player_mind>",
         ]
@@ -776,7 +1199,22 @@ class LLMAgent(Agent):
         return self._ask_json_inner(prompt, default, max_tokens=max_tokens, action=action)
 
     def _ask_talk(self, prompt: str, default: dict[str, Any], *, max_tokens: int = 640) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Handle talk action with free-text output at high temperature."""
+        """Legacy method kept for compatibility — delegates to new wolfcha-style."""
+        return self._ask_json_inner(prompt, default, max_tokens=max_tokens, action="talk")
+
+    def _ask_talk_wolfcha(
+        self,
+        *,
+        system_parts: list[dict],
+        user_prompt: str,
+        focus_angle: str,
+        fallback_speech: str,
+        max_tokens: int = 1024,
+    ) -> tuple[str, dict]:
+        """Wolfcha-style talk generation: system parts + user prompt → JSON string array.
+
+        Returns (speech_text, metadata). Speech is joined from parsed JSON array segments.
+        """
         meta = {
             "provider": self.provider,
             "model": self.client.model,
@@ -784,72 +1222,150 @@ class LLMAgent(Agent):
             "fallback": True,
         }
         try:
-            system = self._build_system_prompt()
-            # First attempt: free text at speech temperature
-            response = self.client.chat_sync(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
+            # Build system message from parts
+            system_content = self._assemble_system_parts(system_parts, focus_angle)
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            # First attempt: speech temperature 1.1
+            resp = self.client.chat_sync(
+                messages=messages,
                 temperature=self.speech_temperature,
                 max_tokens=max_tokens,
                 thinking=False,
             )
-            text = self.client.parse_response(response).strip()
-            usage = response.get("usage", {}) if isinstance(response, dict) else {}
-            # Remove common prefixes (model sometimes adds them despite instructions)
-            for prefix in ["发言：", "发言:", "我说：", "我说:", "speech：", "speech:"]:
-                if text.startswith(prefix):
-                    text = text[len(prefix):].strip()
-            # Remove surrounding quotes
-            if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
-                text = text[1:-1].strip()
-            # Remove ``` blocks
-            if text.startswith("```"):
-                lines = text.split("\n")
-                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+            text = self.client.parse_response(resp).strip()
+            usage = resp.get("usage", {}) if isinstance(resp, dict) else {}
 
-            if text and len(text) >= 2:
+            # Parse JSON string array: ["msg1", "msg2"]
+            segments = self._parse_speech_array(text)
+            if segments:
+                speech = "\n\n".join(segments)
                 self.last_error = None
                 meta["source"] = "llm"
                 meta["fallback"] = False
                 meta["raw_text"] = text[:400]
                 meta["attempts"] = 1
+                meta["segment_count"] = len(segments)
+                meta["segment_texts"] = segments
                 meta["usage"] = usage
-                return {"speech": text, "reasoning": ""}, meta
+                return speech, meta
 
-            # Second attempt: try JSON format (some models prefer structured output)
-            json_prompt = prompt + "\n\n输出格式：{\"speech\": \"你的发言\"}"
-            response2 = self.client.chat_sync(
+            # Second attempt: retry with lower temp
+            retry_prompt = user_prompt + "\n\n请输出JSON字符串数组。"
+            resp2 = self.client.chat_sync(
                 messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json_prompt},
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": retry_prompt},
                 ],
-                temperature=0.8,
+                temperature=0.9,
                 max_tokens=max_tokens,
                 thinking=False,
             )
-            text2 = self.client.parse_response(response2).strip()
-            usage2 = response2.get("usage", {}) if isinstance(response2, dict) else {}
-            parsed = self._coerce_json(text2)
-            if parsed and parsed.get("speech"):
+            text2 = self.client.parse_response(resp2).strip()
+            usage2 = resp2.get("usage", {}) if isinstance(resp2, dict) else {}
+            segments2 = self._parse_speech_array(text2)
+            if segments2:
+                speech = "\n\n".join(segments2)
                 self.last_error = None
                 meta["source"] = "llm"
                 meta["fallback"] = False
                 meta["raw_text"] = text2[:400]
                 meta["attempts"] = 2
+                meta["segment_count"] = len(segments2)
+                meta["segment_texts"] = segments2
                 meta["usage"] = usage2
-                return {"speech": str(parsed["speech"]), "reasoning": str(parsed.get("reasoning", ""))}, meta
+                return speech, meta
 
-            self.last_error = "talk_parse_failed"
+            # Third attempt: just use raw text as speech (free-text fallback)
+            cleaned = self._clean_speech_text(text)
+            if cleaned and len(cleaned) >= 2:
+                meta["source"] = "llm"
+                meta["fallback"] = False
+                meta["raw_text"] = text[:400]
+                meta["attempts"] = 3
+                meta["segments"] = 1
+                meta["usage"] = usage
+                return cleaned, meta
+
+            self.last_error = "talk_all_attempts_failed"
             meta["error"] = self.last_error
             meta["raw_text"] = text[:400]
             meta["usage"] = usage
-            return default, meta
+            return fallback_speech, meta
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             meta["error"] = self.last_error
-            return default, meta
+            return fallback_speech, meta
+
+    def _assemble_system_parts(self, parts: list[dict], focus_angle: str) -> str:
+        """Assemble wolfcha-style system prompt from cacheable/non-cacheable parts."""
+        text_parts = [p["text"] for p in parts if p.get("text")]
+        if focus_angle:
+            text_parts.append(focus_angle)
+        return "\n\n".join(text_parts)
+
+    def _parse_speech_array(self, text: str) -> list[str]:
+        """Parse LLM output as JSON string array (wolfcha format): [\"msg1\", \"msg2\"]."""
+        if not text:
+            return []
+        # Try direct JSON parse
+        try:
+            import json as _json
+            parsed = _json.loads(text)
+            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                return [s.strip() for s in parsed if s.strip()]
+        except Exception:
+            pass
+        # Try extracting JSON array from text
+        start = text.find("[")
+        end = text.rfind("]")
+        if start >= 0 and end > start:
+            try:
+                import json as _json
+                parsed = _json.loads(text[start:end + 1])
+                if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                    return [s.strip() for s in parsed if s.strip()]
+            except Exception:
+                pass
+        # Try extracting individual quoted strings
+        return self._extract_quoted_segments(text)
+
+    def _extract_quoted_segments(self, text: str) -> list[str]:
+        """Extract Chinese-quoted strings from text fallback."""
+        import re
+        # Match both "..." and "..." patterns
+        segments = []
+        for match in re.finditer(r'"([^"]{2,})"', text):
+            seg = match.group(1).strip()
+            if seg and not seg.startswith("{") and not seg.startswith("["):
+                segments.append(seg)
+        if not segments:
+            # Try Chinese quotes
+            for match in re.finditer(r'“([^”]{2,})”', text):
+                seg = match.group(1).strip()
+                if seg:
+                    segments.append(seg)
+        return segments
+
+    def _clean_speech_text(self, text: str) -> str:
+        """Clean raw speech text from common artifacts."""
+        if not text:
+            return ""
+        # Remove prefixes
+        for prefix in ["发言：", "发言:", "我说：", "我说:", "speech：", "speech:"]:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        # Remove surrounding quotes
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1].strip()
+        # Remove code blocks
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:]).strip()
+        return text
 
     def _ask_json_inner(self, prompt: str, default: dict[str, Any], *, max_tokens: int = 640, action: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
         meta = {

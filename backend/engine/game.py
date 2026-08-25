@@ -415,21 +415,7 @@ class WerewolfGame:
             decision = self._ask(player, "BADGE_SPEECH", lambda agent: agent.talk())
             if not self.validator.validate(self.state, decision):
                 return
-            self._log(
-                EventType.CHAT_MESSAGE,
-                "public",
-                {
-                    "actor_id": player.id,
-                    "actor_name": player.name,
-                    "speech": decision.speech or "",
-                    "reasoning": decision.reasoning,
-                    "agent_source": decision.metadata.get("source"),
-                    "agent_model": decision.metadata.get("model"),
-                    "agent_provider": decision.metadata.get("provider"),
-                    "agent_fallback": bool(decision.metadata.get("fallback", False)),
-                    "badge_campaign": True,
-                },
-            )
+            self._emit_speech(player, decision, {"badge_campaign": True})
             if self._maybe_white_wolf_king_boom(player):
                 return
         self._run_actor_sequence(Phase.DAY_BADGE_SPEECH, candidates, handle)
@@ -650,20 +636,7 @@ class WerewolfGame:
             decision = self._ask(player, "TALK", lambda agent: agent.talk())
             if not self.validator.validate(self.state, decision):
                 return
-            self._log(
-                EventType.CHAT_MESSAGE,
-                "public",
-                {
-                    "actor_id": player.id,
-                    "actor_name": player.name,
-                    "speech": decision.speech or "",
-                    "reasoning": decision.reasoning,
-                    "agent_source": decision.metadata.get("source"),
-                    "agent_model": decision.metadata.get("model"),
-                    "agent_provider": decision.metadata.get("provider"),
-                    "agent_fallback": bool(decision.metadata.get("fallback", False)),
-                },
-            )
+            self._emit_speech(player, decision, {})
             if self._maybe_white_wolf_king_boom(player):
                 return
         speakers = self._day_speech_order()
@@ -682,21 +655,7 @@ class WerewolfGame:
             decision = self._ask(player, "TALK", lambda agent: agent.talk())
             if not self.validator.validate(self.state, decision):
                 return
-            self._log(
-                EventType.CHAT_MESSAGE,
-                "public",
-                {
-                    "actor_id": player.id,
-                    "actor_name": player.name,
-                    "speech": decision.speech or "",
-                    "reasoning": decision.reasoning,
-                    "agent_source": decision.metadata.get("source"),
-                    "agent_model": decision.metadata.get("model"),
-                    "agent_provider": decision.metadata.get("provider"),
-                    "agent_fallback": bool(decision.metadata.get("fallback", False)),
-                    "pk_speech": True,
-                },
-            )
+            self._emit_speech(player, decision, {"pk_speech": True})
             if self._maybe_white_wolf_king_boom(player):
                 return
 
@@ -857,22 +816,31 @@ class WerewolfGame:
         decision = self._ask(player, "LAST_WORDS", lambda agent: agent.talk())
         if not self.validator.validate(self.state, decision):
             return
-        self._log(
-            EventType.CHAT_MESSAGE,
-            "public",
-            {
+        self._emit_speech(player, decision, {"last_words": True})
+        self.state.current_speaker_id = None
+
+    def _emit_speech(self, player: Player, decision: Decision, extra_fields: dict) -> None:
+        """Emit CHAT_MESSAGE events. Uses pre-parsed segments from metadata if available."""
+        raw_segments = decision.metadata.get("segments")
+        if raw_segments and isinstance(raw_segments, list) and len(raw_segments) > 0:
+            segments = [str(s) for s in raw_segments]
+        else:
+            segments = [decision.speech or ""]
+        for i, segment in enumerate(segments):
+            payload = {
                 "actor_id": player.id,
                 "actor_name": player.name,
-                "speech": decision.speech or "",
-                "reasoning": decision.reasoning,
-                "agent_source": decision.metadata.get("source"),
-                "agent_model": decision.metadata.get("model"),
-                "agent_provider": decision.metadata.get("provider"),
-                "agent_fallback": bool(decision.metadata.get("fallback", False)),
-                "last_words": True,
-            },
-        )
-        self.state.current_speaker_id = None
+                "speech": segment,
+                "reasoning": decision.reasoning if i == 0 else "",
+                "segment_index": i,
+                "segment_total": len(segments),
+                "agent_source": decision.metadata.get("source") if i == 0 else "",
+                "agent_model": decision.metadata.get("model") if i == 0 else "",
+                "agent_provider": decision.metadata.get("provider") if i == 0 else "",
+                "agent_fallback": bool(decision.metadata.get("fallback", False)) if i == 0 else False,
+                **extra_fields,
+            }
+            self._log(EventType.CHAT_MESSAGE, "public", payload)
 
     def _maybe_white_wolf_king_boom(self, player: Player) -> bool:
         if player.role != Role.WHITE_WOLF_KING or not player.alive or self.state.abilities.white_wolf_king_boom_used:
