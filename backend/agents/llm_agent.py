@@ -15,12 +15,26 @@ from backend.engine.visibility import PlayerView
 from backend.llm import create_client
 
 
+class LLMFallbackForbidden(RuntimeError):
+    """Raised when LLMAgent.STRICT_NO_FALLBACK=True and a fallback would
+    otherwise be returned. Used by the strict acceptance runner to abort the
+    game instead of silently degrading to heuristic decisions."""
+
+
 class LLMAgent(Agent):
     """LLM-backed agent with heuristic fallback.
 
     The fallback preserves playability if the API is slow, unavailable, or
     produces malformed output.
+
+    For acceptance validation (Track B §34 / Track C §19) we expose
+    `STRICT_NO_FALLBACK`. When this class attribute is True, the agent
+    raises `LLMFallbackForbidden` instead of silently returning a heuristic
+    decision so that the surrounding harness can abort the game and refuse
+    to publish data produced by a non-LLM path.
     """
+
+    STRICT_NO_FALLBACK: bool = False
 
     def __init__(
         self,
@@ -67,9 +81,21 @@ class LLMAgent(Agent):
         self.fallback.update(view, request)
         self.memory.append(f"{request} day={view.day} phase={view.phase}")
         try:
-            from backend.eval.evolution import StrategyKnowledgeStore, StrategyRetrievalQuery
-            self.current_retrieval = StrategyKnowledgeStore().retrieve(
-                StrategyRetrievalQuery(role=self.role.value, phase=view.phase, observation_summary=""))
+            from backend.db.persist import retrieve_strategy_knowledge
+            from backend.eval.evolution import RetrievedStrategyLesson, StrategyRetrievalQuery
+
+            rows = retrieve_strategy_knowledge(
+                StrategyRetrievalQuery(
+                    role=self.role.value,
+                    phase=view.phase,
+                    observation_summary=self._retrieval_observation_summary(view, request),
+                    situation_tags=[request, view.phase],
+                    persona_mbti=self.character.persona.mbti if self.character else None,
+                    persona_style=self.character.persona.style_label if self.character else None,
+                    top_k=3,
+                )
+            )
+            self.current_retrieval = [RetrievedStrategyLesson(**row) for row in rows]
         except Exception:
             self.current_retrieval = []
 
@@ -166,7 +192,7 @@ class LLMAgent(Agent):
             meta["retrieved_knowledge_ids"] = []
             meta["retrieval_used"] = False
             return
-        meta["retrieved_knowledge_ids"] = [item.doc.doc_id for item in self.current_retrieval]
+        meta["retrieved_knowledge_ids"] = [item.doc_id for item in self.current_retrieval]
         meta["retrieval_query_summary"] = {
             "role": self.role.value,
             "phase": self._view().phase,
@@ -175,9 +201,9 @@ class LLMAgent(Agent):
         meta["retrieval_used"] = True
         meta["retrieved_knowledge"] = [
             {
-                "doc_id": item.doc.doc_id,
+                "doc_id": item.doc_id,
                 "score": item.score,
-                "recommended_action": item.doc.recommended_action,
+                "recommended_action": item.recommendation,
             }
             for item in self.current_retrieval
         ]
@@ -190,8 +216,40 @@ class LLMAgent(Agent):
             "这些是从已通过校验的历史复盘中抽象出的策略知识，只能作为一般玩法提醒，不能当作本局隐藏身份事实。",
         ]
         for index, item in enumerate(self.current_retrieval, start=1):
-            lines.append(f"{index}. {item.to_prompt_line()}")
+            lines.append(
+                f"{index}. [{item.doc_id} score={item.score:.2f}] "
+                f"触发：{item.trigger}；建议：{item.recommendation}；理由：{item.rationale}"
+            )
         return "\n".join(lines)
+
+    def _retrieval_observation_summary(self, view: PlayerView, request: str) -> str:
+        public_tail = view.public_events[-8:]
+        private_tail = view.private_events[-5:]
+        parts = [
+            f"request={request}",
+            f"day={view.day}",
+            f"phase={view.phase}",
+            f"role={view.self_player.get('role')}",
+        ]
+        for event in public_tail:
+            payload = event.get("payload") or {}
+            parts.append(
+                "public:"
+                + " ".join(
+                    str(payload.get(key) or "")
+                    for key in ("message", "speech", "actor_name", "target_name", "reason")
+                )
+            )
+        for event in private_tail:
+            payload = event.get("payload") or {}
+            parts.append(
+                "private:"
+                + " ".join(
+                    str(payload.get(key) or "")
+                    for key in ("kind", "message", "target_name", "action_type")
+                )
+            )
+        return "\n".join(item for item in parts if item.strip())
 
     # ============================================================
     # Wolfcha-style talk prompt builders
@@ -1426,6 +1484,7 @@ class LLMAgent(Agent):
             "source": "fallback",
             "fallback": True,
         }
+        total_latency_ms = 0
         try:
             # Build system message from parts
             system_content = self._assemble_system_parts(system_parts, focus_angle)
@@ -1443,6 +1502,7 @@ class LLMAgent(Agent):
             )
             text = self.client.parse_response(resp).strip()
             usage = resp.get("usage", {}) if isinstance(resp, dict) else {}
+            total_latency_ms += int(resp.get("_latency_ms", 0)) if isinstance(resp, dict) else 0
 
             # Parse JSON string array: ["msg1", "msg2"]
             segments = self._parse_speech_array(text)
@@ -1457,6 +1517,7 @@ class LLMAgent(Agent):
                     meta["segment_count"] = len(segments)
                     meta["segment_texts"] = segments
                     meta["usage"] = usage
+                    meta["latency_ms"] = total_latency_ms
                     return speech, meta
 
             # Second attempt: retry with lower temp
@@ -1472,6 +1533,7 @@ class LLMAgent(Agent):
             )
             text2 = self.client.parse_response(resp2).strip()
             usage2 = resp2.get("usage", {}) if isinstance(resp2, dict) else {}
+            total_latency_ms += int(resp2.get("_latency_ms", 0)) if isinstance(resp2, dict) else 0
             segments2 = self._parse_speech_array(text2)
             if segments2:
                 if not self._looks_generic_speech(segments2):
@@ -1484,6 +1546,7 @@ class LLMAgent(Agent):
                     meta["segment_count"] = len(segments2)
                     meta["segment_texts"] = segments2
                     meta["usage"] = usage2
+                    meta["latency_ms"] = total_latency_ms
                     return speech, meta
 
             # Third attempt: just use raw text as speech (free-text fallback)
@@ -1495,16 +1558,29 @@ class LLMAgent(Agent):
                 meta["attempts"] = 3
                 meta["segments"] = 1
                 meta["usage"] = usage
+                meta["latency_ms"] = total_latency_ms
                 return cleaned, meta
 
             self.last_error = "talk_all_attempts_failed"
             meta["error"] = self.last_error
             meta["raw_text"] = text[:400]
             meta["usage"] = usage
+            meta["latency_ms"] = total_latency_ms
+            if LLMAgent.STRICT_NO_FALLBACK:
+                raise LLMFallbackForbidden(
+                    f"Talk fallback would fire for {self.player_id}; "
+                    f"error={self.last_error}; raw={text[:120]}"
+                )
             return fallback_speech, meta
+        except LLMFallbackForbidden:
+            raise
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             meta["error"] = self.last_error
+            if LLMAgent.STRICT_NO_FALLBACK:
+                raise LLMFallbackForbidden(
+                    f"Talk fallback would fire for {self.player_id}; reason={self.last_error}"
+                ) from exc
             return fallback_speech, meta
 
     def _assemble_system_parts(self, parts: list[dict], focus_angle: str) -> str:
@@ -1630,6 +1706,7 @@ class LLMAgent(Agent):
             "source": "fallback",
             "fallback": True,
         }
+        total_latency_ms = 0
         try:
             system = self._build_system_prompt()
             # Use high temperature for speech, normal for other actions
@@ -1687,6 +1764,7 @@ class LLMAgent(Agent):
                 text = self.client.parse_response(response).strip()
                 last_text = text
                 last_usage = response.get("usage", {}) if isinstance(response, dict) else {}
+                total_latency_ms += int(response.get("_latency_ms", 0)) if isinstance(response, dict) else 0
                 parsed = self._coerce_json(text)
                 if parsed is not None:
                     self.last_error = None
@@ -1695,18 +1773,31 @@ class LLMAgent(Agent):
                     meta["raw_text"] = text[:400]
                     meta["attempts"] = idx + 1
                     meta["usage"] = last_usage
+                    meta["latency_ms"] = total_latency_ms
                     self._attach_retrieval_meta(meta)
                     return parsed, meta
             self.last_error = "json_parse_failed"
             meta["error"] = self.last_error
             meta["raw_text"] = last_text[:400]
             meta["usage"] = last_usage
+            meta["latency_ms"] = total_latency_ms
             self._attach_retrieval_meta(meta)
+            if LLMAgent.STRICT_NO_FALLBACK:
+                raise LLMFallbackForbidden(
+                    f"JSON fallback would fire for {self.player_id} action={action}; "
+                    f"error={self.last_error}; raw={last_text[:120]}"
+                )
             return default, meta
+        except LLMFallbackForbidden:
+            raise
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             meta["error"] = self.last_error
             self._attach_retrieval_meta(meta)
+            if LLMAgent.STRICT_NO_FALLBACK:
+                raise LLMFallbackForbidden(
+                    f"JSON fallback would fire for {self.player_id} action={action}; reason={self.last_error}"
+                ) from exc
             return default, meta
 
     def _coerce_json(self, text: str) -> dict[str, Any] | None:
