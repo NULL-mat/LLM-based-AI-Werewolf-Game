@@ -151,6 +151,8 @@ activemq-data/
 # Environments
 .env
 .envrc
+.env.local
+.env.*.local
 .venv
 env/
 venv/
@@ -244,3 +246,13 @@ frontend/photos/
 # Planning docs (transient)
 plans/
 .claude/skills/
+
+# AI tooling caches (large, local-only)
+.claude/
+.codegraph/
+
+# Local backups
+backups/
+
+# Root-level experiment/result JSON artifacts
+/*.json
