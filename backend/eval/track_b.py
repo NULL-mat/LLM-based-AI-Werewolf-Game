@@ -22,17 +22,13 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from backend.engine.models import EventType, GameEvent, GameState, Phase
+from backend.eval.types import (
+    BadCaseReport, CounterfactualCase, MVPResult, PlayerReview,
+    ReportEvaluationResult, ReviewReport, StrategySuggestion, TurningPoint,
+)
 from backend.eval.review import (
-    BadCaseReport,
-    CounterfactualCase,
     LeaderboardAggregator,
     MarkdownReportRenderer,
-    MVPResult,
-    PlayerReview,
-    ReportEvaluationResult,
-    ReviewReport,
-    StrategySuggestion,
-    TurningPoint,
     generate_review_report,
 )
 
@@ -261,8 +257,90 @@ class VisualReportAgent:
         """
 
 
+    def render_vote_flow(self, document: PublishedReviewDocument) -> str:
+        """Vote flow diagram: who voted for whom across days (sankey-style SVG)."""
+        votes = document.replay_bundle.get("votes", [])
+        players = document.replay_bundle.get("players", [])
+        names = {p["id"]: p["name"] for p in players}
+        if not votes: return ""
+        by_day: dict[int, list[dict]] = {}
+        for v in votes:
+            by_day.setdefault(v.get("day", 0), []).append(v)
+        days = sorted(by_day.keys())[-3:]
+        width, cell_h, row_h = 980, 28, 36
+        height = 50 + len(days) * (len(players) * row_h + 20)
+        nodes = [f'<rect width="{width}" height="{height}" rx="24" fill="#fffaf3" stroke="#e5d3bd"/>',
+                 f'<text x="36" y="34" font-size="16" font-weight="700" fill="#1f1a17">Vote Flow</text>']
+        y = 50
+        for day in days:
+            day_votes = by_day.get(day, [])
+            nodes.append(f'<text x="36" y="{y+18}" font-size="14" fill="#9c5d2c">Day {day}</text>')
+            y += 24
+            for v in day_votes[:len(players)*2]:
+                voter_n = escape(names.get(v.get("voter_id",""), "?"))
+                target_n = escape(names.get(v.get("target_id",""), "?"))
+                nodes.append(f'<text x="36" y="{y+18}" font-size="12" fill="#4b3d34">{voter_n} → {target_n}</text>')
+                y += row_h
+            y += 8
+        return f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">{"".join(nodes)}</svg>'
+
+    def render_decision_trajectory(self, document: PublishedReviewDocument) -> str:
+        """Per-player decision quality trajectory (SVG line chart)."""
+        per_step = document.review_report.get("metadata", {}).get("per_step_scores", [])
+        if not per_step: return ""
+        players = {}
+        for ps in per_step:
+            players.setdefault(ps.get("player_name","?"), []).append(ps)
+        width, height = 980, 120 + len(players) * 80
+        nodes = [f'<rect width="{width}" height="{height}" rx="24" fill="#fffaf3" stroke="#e5d3bd"/>',
+                 f'<text x="36" y="34" font-size="16" font-weight="700" fill="#1f1a17">Decision Quality Trajectory</text>']
+        colors = ["#9c5d2c","#4a90d9","#e74c3c","#27ae60","#8e44ad","#f39c12","#1abc9c"]
+        y = 50
+        for pi, (pname, scores) in enumerate(players.items()):
+            color = colors[pi % len(colors)]
+            nodes.append(f'<text x="36" y="{y+16}" font-size="12" fill="{color}">{escape(pname)}</text>')
+            if len(scores) >= 2:
+                step_w = (width - 80) / max(len(scores)-1, 1)
+                pts = [f"{80+i*step_w:.0f},{y+50 - s.get('overall_score',0.5)*30:.0f}" for i,s in enumerate(scores)]
+                nodes.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2"/>')
+            y += 70
+        return f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">{"".join(nodes)}</svg>'
+
+    def render_score_radar(self, document: PublishedReviewDocument) -> str:
+        """Multi-dimensional score radar for top 3 players (SVG)."""
+        scoreboard = document.review_report.get("scoreboard", [])[:3]
+        players = document.replay_bundle.get("players", [])
+        names = {p["id"]: p["name"] for p in players}
+        if not scoreboard: return ""
+        width, height, cx, cy, r = 400, 300, 180, 150, 110
+        dims = ["strategy","logic","social"]
+        colors = ["#9c5d2c","#4a90d9","#e74c3c"]
+        angles = {d: -90 + i*120 for i,d in enumerate(dims)}
+        nodes = [f'<rect width="{width}" height="{height}" rx="20" fill="#fffaf3" stroke="#e5d3bd"/>',
+                 f'<text x="20" y="28" font-size="14" font-weight="700" fill="#1f1a17">Score Radar</text>']
+        for level in [0.3, 0.6, 0.9]:
+            pts = [f"{cx+r*level*__import__('math').cos(__import__('math').radians(a)):.0f},{cy+r*level*__import__('math').sin(__import__('math').radians(a)):.0f}" for a in angles.values()]
+            nodes.append(f'<polygon points="{" ".join(pts)}" fill="none" stroke="#e5d3bd" stroke-width="1"/>')
+        for dim, angle in angles.items():
+            lx = cx + r*1.05 * __import__('math').cos(__import__('math').radians(angle))
+            ly = cy + r*1.05 * __import__('math').sin(__import__('math').radians(angle))
+            nodes.append(f'<text x="{lx-16:.0f}" y="{ly+4:.0f}" font-size="10" fill="#7a6c62" text-anchor="middle">{dim}</text>')
+        for pi, player in enumerate(scoreboard):
+            pid = player.get("player_id","")
+            pname = escape(names.get(pid, player.get("player_name","?")))
+            scores = player.get("judge_scores", {})
+            pts = []
+            for dim, angle in angles.items():
+                s = scores.get(dim, 0.5) / 10.0
+                x = cx + r*s * __import__('math').cos(__import__('math').radians(angle))
+                y = cy + r*s * __import__('math').sin(__import__('math').radians(angle))
+                pts.append(f"{x:.0f},{y:.0f}")
+            nodes.append(f'<polygon points="{" ".join(pts)}" fill="{colors[pi]}" fill-opacity="0.2" stroke="{colors[pi]}" stroke-width="2"/>')
+            nodes.append(f'<text x="20" y="{270+pi*14}" font-size="10" fill="{colors[pi]}">{pname}</text>')
+        return f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">{"".join(nodes)}</svg>'
+
+
 class HTMLReviewRenderer:
-    """Standalone HTML renderer with lightweight chart-style visuals."""
 
     def render(self, document: PublishedReviewDocument) -> str:
         visual_agent = VisualReportAgent()
@@ -1348,7 +1426,188 @@ def _record_knowledge_usage(state: GameState, review_report: dict[str, Any]) -> 
     return feedback
 
 
-def generate_published_review_document(state: GameState, *, view_scope: str = "moderator_view") -> PublishedReviewDocument:
+def _compute_per_step_scores(
+    state: GameState,
+    replay_bundle: ReplayBundle,
+    speech_acts: list[SpeechAct],
+    *,
+    llm_client: Any = None,
+    cascade: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute per-step decision scores with optional three-tier cascade.
+
+    Tier 1 (deterministic): Always runs — hard rules for all decisions. Free, instant.
+    Tier 2 (light LLM):    Activates when cascade=True + llm_client is set.
+                            Single-judge LLM for ambiguous decisions (~12% of total).
+    Tier 3 (heavy LLM):    3-judge panel for high-impact + ambiguous (~3% of total).
+
+    Args:
+        state: Full game state.
+        replay_bundle: Replay data including decisions.
+        speech_acts: Analyzed speech acts.
+        llm_client: Optional LLM client for Tier 2/3 scoring.
+        cascade: If True and llm_client is provided, run the three-tier cascade.
+    """
+    from backend.eval.per_step_scorer import PerStepScorer
+
+    scorer = PerStepScorer(llm_client=llm_client)
+    players = {p.id: p for p in state.players}
+    state_dict = {
+        "players": [{
+            "id": p.id, "name": p.name, "role": p.role.value if hasattr(p.role, 'value') else str(p.role),
+            "alignment": p.alignment.value if hasattr(p.alignment, 'value') else str(p.alignment),
+            "alive": p.alive,
+        } for p in state.players],
+    }
+    acts_dicts = [
+        {"player_id": a.player_id, "day": a.day, "stance": a.stance,
+         "suspected_players": a.suspected_players, "defended_players": a.defended_players,
+         "grounded_event_ids": a.grounded_event_ids, "risk_flags": a.risk_flags}
+        for a in speech_acts
+    ]
+
+    # Build decision dicts for score_all (standard format)
+    decision_dicts = []
+    for decision in (replay_bundle.decisions or []):
+        pa = decision.get("selected_action") or {}
+        player_id = decision.get("player_id", "")
+        player = players.get(player_id)
+        if player is None:
+            continue
+        decision_dicts.append({
+            "id": decision.get("decision_id", ""),
+            "player_id": player_id,
+            "player_name": player.name,
+            "player_role": player.role.value if hasattr(player.role, 'value') else str(player.role),
+            "day": decision.get("day", 0),
+            "phase": decision.get("phase", ""),
+            "target_id": pa.get("target_id", ""),
+            "action_type": pa.get("action_type", ""),
+            "raw_text": str(pa.get("reasoning", "") or ""),
+        })
+
+    # Run cascade scoring
+    if cascade and llm_client is not None:
+        scores = scorer.score_all(decision_dicts, state_dict, acts_dicts, light_llm=True, heavy_llm=True)
+        tier_counts = scorer.tally_tiers(scores)
+        import logging
+        logging.getLogger(__name__).info(f"Per-step cascade complete: {tier_counts}")
+    else:
+        scores = scorer.score_all(decision_dicts, state_dict, acts_dicts)
+
+    return [
+        {
+            "decision_id": s.decision_id, "player_name": s.player_name,
+            "role": s.role, "day": s.day, "phase": s.phase,
+            "action_type": s.action_type, "correctness": s.correctness,
+            "overall_score": s.overall_score, "evidence": s.evidence,
+            "scoring_tier": s.scoring_tier,
+            "light_llm_score": s.light_llm_score,
+            "heavy_llm_score": s.heavy_llm_score,
+            "metadata": s.metadata,
+        }
+        for s in scores
+    ]
+
+
+def _compute_llm_game_scores(
+    state: GameState,
+    replay_bundle: ReplayBundle,
+    llm_client: Any,
+) -> list[dict[str, Any]] | None:
+    """Run full LLM Judge Panel (3-judge + Critic round) for game-level scoring.
+
+    This is the heaviest scoring tier — 3 specialized judges independently score
+    each player on strategy, logic, and social dimensions, then a Critic round
+    challenges extreme scores, followed by trimmed-mean aggregation.
+
+    Args:
+        state: Full game state.
+        replay_bundle: Replay data including decisions.
+        llm_client: LLM client (must support chat_sync).
+
+    Returns:
+        List of GameLevelScore dicts, or None on failure.
+    """
+    try:
+        from backend.eval.llm_judge import LLMJudgePanel
+
+        panel = LLMJudgePanel(llm_client)
+
+        # Build game_state dict for the judge panel
+        game_state_dict = {
+            "winner": str(state.winner or "unknown"),
+            "players": [{
+                "name": p.name,
+                "role": p.role.value if hasattr(p.role, 'value') else str(p.role),
+                "alignment": p.alignment.value if hasattr(p.alignment, 'value') else str(p.alignment),
+            } for p in state.players],
+            "events": [
+                {
+                    "type": e.type.value if hasattr(e.type, 'value') else str(e.type),
+                    "day": e.day,
+                    "phase": e.phase.value if hasattr(e.phase, 'value') else str(e.phase),
+                    "payload": e.payload or {},
+                }
+                for e in state.events[-200:]  # Last 200 events max
+            ],
+        }
+
+        # Build player_decisions dict
+        player_decisions: dict[str, list[dict]] = {}
+        for decision in (replay_bundle.decisions or []):
+            pa = decision.get("selected_action") or {}
+            player_name = decision.get("player_name", "") or str(
+                next((p.name for p in state.players if p.id == decision.get("player_id", "")), "")
+            )
+            if not player_name:
+                continue
+            player_decisions.setdefault(player_name, []).append({
+                "id": decision.get("decision_id", ""),
+                "player_name": player_name,
+                "player_role": decision.get("player_role", ""),
+                "day": decision.get("day", 0),
+                "phase": decision.get("phase", ""),
+                "action_type": pa.get("action_type", ""),
+                "target_id": pa.get("target_id", ""),
+                "raw_text": str(pa.get("reasoning", "") or ""),
+            })
+
+        game_scores = panel.score_game(game_state_dict, player_decisions)
+
+        return [
+            {
+                "player_name": s.player_name, "role": s.role, "alignment": s.alignment,
+                "strategy_score": s.strategy_score, "logic_score": s.logic_score,
+                "social_score": s.social_score, "composite": s.composite,
+                "judge_agreement": s.judge_agreement,
+                "rubric_hash": s.rubric_hash,
+            }
+            for s in game_scores
+        ]
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"LLM game-level scoring failed: {e}")
+        return None
+
+
+def generate_published_review_document(
+    state: GameState, *,
+    view_scope: str = "moderator_view",
+    llm_client: Any = None,
+    cascade: bool = False,
+) -> PublishedReviewDocument:
+    """Generate a complete published review document for a finished game.
+
+    Args:
+        state: Completed game state.
+        view_scope: Visibility scope for the published document.
+        llm_client: Optional LLM client. When provided with cascade=True,
+                    enables Tier 2 (light LLM single-judge) and Tier 3
+                    (heavy LLM 3-judge panel) scoring.
+        cascade: If True and llm_client is provided, run three-tier cascade
+                 (deterministic → light LLM → heavy LLM).
+    """
     replay_bundle = ReplayBundleBuilder().build(state)
     generated = generate_review_report(state)
     review_report = dict(generated["report"])
@@ -1377,6 +1636,18 @@ def generate_published_review_document(state: GameState, *, view_scope: str = "m
         # demote unhelpful knowledge over time.
         knowledge_feedback = _record_knowledge_usage(state, review_report)
     leaderboard_snapshot = _build_leaderboard_snapshot(review_report)
+    # B Track: per-step decision scoring (three-tier cascade when llm_client provided)
+    per_step_scores = _compute_per_step_scores(
+        state, replay_bundle, speech_acts,
+        llm_client=llm_client, cascade=cascade,
+    )
+    review_report.setdefault("metadata", {})["per_step_scores"] = per_step_scores
+
+    # C Track: LLM Judge Panel game-level scoring (optional, heavy)
+    if cascade and llm_client is not None:
+        llm_game_scores = _compute_llm_game_scores(state, replay_bundle, llm_client)
+        if llm_game_scores:
+            review_report.setdefault("metadata", {})["llm_game_scores"] = llm_game_scores
     preview_document = PublishedReviewDocument(
         report_id=str(uuid4()),
         game_id=state.id,

@@ -22,7 +22,7 @@ AI 狼人杀多智能体对战系统。每个 Agent 根据扮演角色（狼人 
 - **7~12 人板子** — wolfcha 风格（默认 7 人：2 狼 + 预言家 + 女巫 + 猎人 + 守卫 + 村民），更多人数自动加入白狼王/白痴。
 - **完整对局流程** — 夜晚守护/狼人刀人/女巫用药/预言家查验/夜晚结算/警长竞选/白天发言/投票/PK 加赛/猎人开枪/白狼王自爆/胜负判定。
 - **三类 Agent**
-  - `LLMAgent` — 调用方舟 doubao 或 DeepSeek API，按角色定制 Prompt、CoT 推理、JSON 输出解析；解析失败自动回退到启发式 Agent。
+  - `LLMAgent` — 调用方舟 doubao API，按角色定制 Prompt、CoT 推理、JSON 输出解析；解析失败自动回退到启发式 Agent。
   - `HeuristicAgent` — 纯离线启发式策略，作为 fallback 和确定性测试用。
   - `HumanAgent` — 接收前端提交的文字/语音发言、投票、夜晚动作。
 - **wolfcha 人设系统** — 每位玩家拥有 Persona（MBTI、年龄、背景、说话风格、压力反应）+ PlayerMind（勇气、记忆偏好、桌面存在感等），影响发言风格与决策倾向。
@@ -33,6 +33,13 @@ AI 狼人杀多智能体对战系统。每个 Agent 根据扮演角色（狼人 
 
 ### Track B — 评测复盘（已实装）
 - **多维玩家分**（`eval/review.py`） — process_score（0~100，惩罚错投/泄露/逻辑漏洞）+ outcome_bonus（0/100，阵营胜负）+ final_score（综合），分离"过程质量"与"结果偏差"。
+- **ProcessScoreV3**（`eval/process_score_v3.py`） — 角色归一化、置信度感知的玩家过程评分，替代简单加权平均。
+- **HybridScorer**（`eval/hybrid_scorer.py`） — 规则锁定 + LLM 证据校验 + 统计校准的混合评分框架（参考 Rulers 论文）。
+- **PerStepScorer**（`eval/per_step_scorer.py`） — 逐步评分器，对发言/投票/夜间行动进行细粒度评分。
+- **PersonaScorer**（`eval/persona_scorer.py`） — 人设一致性评分，评估玩家是否符合角色设定。
+- **StrategyScorer**（`eval/strategy_scorer.py`） — 策略影响评分，评估策略检索和应用效果。
+- **EloRating**（`eval/elo_rating.py`） — Elo 评分系统，支持跨局排名。
+- **ScoreCalibrator**（`eval/calibration.py`） — Ridge 回归 + 分位数映射的评分校准。
 - **角色 KPI + 跨局排行**（`eval/track_b.py`） — `/api/leaderboard`、`/api/leaderboard/role_matrix`、`/api/metrics/aggregate` 支持按 `agent_label × role × seed × 时间窗` 多维聚合。
 - **Reviewer Agent** — 自动生成关键决策复盘 / 反事实分析 / 改进建议；输出落 `review_reports` 表，可拉 Markdown / HTML / JSON。
 - **校验闭环**（B Repair Loop） — 复盘报告先过 ValidationGate（事实一致、引用完整、配额平衡），失败回炉重写；`scripts/bc_repair_loop_check.py` 跟踪通过率。
@@ -64,7 +71,7 @@ AI 狼人杀多智能体对战系统。每个 Agent 根据扮演角色（狼人 
 python -m pip install -r requirements.txt
 
 # 2. 配置 LLM + DB（已提供 .env.example，复制后填上 key）
-cp .env.example .env  # 编辑填入 DOUBAO_API_KEY 或 DEEPSEEK_API_KEY
+cp .env.example .env  # 编辑填入 DOUBAO_API_KEY
 
 # 3. 起本地 Postgres（推荐；不装也行,会 fallback 到 SQLite）
 make db-up
@@ -179,9 +186,9 @@ backend/
     playbooks.py          # 角色策略简述
     optimization.py       # Prompt 微调辅助
   llm/
-    deepseek.py           # 统一 LLM 客户端
+    llm_client.py           # 统一 LLM 客户端
     env.py                # .env 加载
-    __init__.py           # provider 路由（doubao / deepseek）
+    __init__.py           # provider 路由（doubao）
   db/
     database.py           # SQLAlchemy 引擎（SQLite / Postgres）
     models.py             # 21 张表（见下方"数据库"段）
@@ -249,6 +256,8 @@ docs/
   Track_C_Evolution_Agent_Plan.md # Track C 完整方案
   B_C_OPERATIONAL_REPORT.md       # Track B/C 运维报告
   DEVELOPMENT_ISSUES.md           # 开发坑记录（必读必写）
+  DOC_INDEX.md                    # 文档索引（详见 docs/DOC_INDEX.md）
+  PROJECT_STATUS.md               # 项目状态速览
 
 skills/                           # 团队协作规范（详见 skills/README.md）
   00-team-overview.md / 10-git-workflow.md / 20-backend-conventions.md
@@ -351,8 +360,9 @@ python scripts/track_health.py         # 全链路健康
 | 上手项目 / 速查 | 本 README + [`CLAUDE.md`](CLAUDE.md) |
 | 团队协作规范（必读） | [`skills/README.md`](skills/README.md) → 各 `skills/*.md` |
 | 业务知识（角色 / 阶段 / Prompt） | [`SKILLS.md`](SKILLS.md) + [`docs/REFERENCE.md`](docs/REFERENCE.md) |
-| Track B 完整方案 | [`docs/B_REVIEW_VALIDATION_PLAN.md`](docs/B_REVIEW_VALIDATION_PLAN.md) |
+| Track B 完整方案 | [`docs/track_b_complete.md`](docs/track_b_complete.md) |
 | Track C 完整方案 | [`docs/Track_C_Evolution_Agent_Plan.md`](docs/Track_C_Evolution_Agent_Plan.md) |
-| Track B/C 运维报告 | [`docs/B_C_OPERATIONAL_REPORT.md`](docs/B_C_OPERATIONAL_REPORT.md) |
 | 开发踩坑记录 | [`docs/DEVELOPMENT_ISSUES.md`](docs/DEVELOPMENT_ISSUES.md)（必读必写） |
+| 文档索引 | [`docs/DOC_INDEX.md`](docs/DOC_INDEX.md) |
+| 项目状态 | [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) |
 | 待办 | [`TODO.md`](TODO.md) |
