@@ -151,6 +151,12 @@ class CognitiveAgent:
                         {"alive_player_ids": alive_ids},
                     )
                 except Exception:
+                    import logging
+                    _logger = logging.getLogger(__name__)
+                    _logger.warning(
+                        f"assign_wolf_tactics failed for {self.player_name}, "
+                        f"using empty tactics", exc_info=True
+                    )
                     self._wolf_tactics = {}
 
     def update(self, view: Any, request: str) -> None:
@@ -193,7 +199,12 @@ class CognitiveAgent:
         # Parse multi-bubble speech
         segments = parse_json_array(raw)
         if not segments or (len(segments) == 1 and len(segments[0]) < 3):
-            # Fallback: use raw text as single speech
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.warning(
+                f"Speech parse fallback for {self.player_name}({self._profile.role}): "
+                f"raw_len={len(raw)}, segments_parsed={len(segments) if segments else 0}"
+            )
             speech = raw.strip()[:500] or "我暂时没有更多信息，先听大家发言。"
             segments = [speech]
 
@@ -255,6 +266,12 @@ class CognitiveAgent:
                         public_events=self._view.public_events,
                     )
                 except Exception:
+                    import logging
+                    _logger = logging.getLogger(__name__)
+                    _logger.warning(
+                        f"build_wolf_team_view failed for {self.player_name}, "
+                        f"using None", exc_info=True
+                    )
                     self._wolf_team_view = None
 
         obs = self._observe()
@@ -606,19 +623,45 @@ class CognitiveAgent:
             raise ValueError(f"Unknown action_type: {action_type}")
         return method(**kwargs) if kwargs else method()
 
+    # Night actions where "skip" is a valid strategic choice
+    _SKIP_NIGHT_KEYWORDS = {"空守", "不守", "跳过", "空过", "放弃", "不救", "不用", "不毒", "不验", "不刀"}
+
     def _night_decision(self, result: Dict[str, str], action_type: ActionType) -> Decision:
-        """Create a Decision for a night action."""
-        target_id = self._resolve_target(result["target"])
+        """Create a Decision for a night action.
+
+        Handles strategic skip keywords (空守, 不救, etc.) by mapping them
+        to self-target for Guard and first-alive for other roles.
+        """
+        raw_target = (result.get("target") or "").strip()
+        if raw_target in self._SKIP_NIGHT_KEYWORDS:
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.info(
+                f"Night skip keyword '{raw_target}' from {self.player_name}({self._profile.role}) "
+                f"for {action_type.value} — picking fallback target"
+            )
+            # Prefer self for Guard; first alive for others
+            if action_type == ActionType.GUARD:
+                target_id = self.player_id
+            else:
+                target_id = ""
+                for p in self._view.players:
+                    if p.get("alive"):
+                        target_id = p.get("id", "")
+                        break
+        else:
+            target_id = self._resolve_target(raw_target)
+
         if not target_id and self._strict_no_fallback:
             raise RuntimeError(
                 f"LLM returned unresolved {action_type.value} target: {result['target']!r}"
             )
         if not target_id:
             for p in self._view.players:
-                if p["alive"]:
-                    target_id = p["id"]
+                if p.get("alive"):
+                    target_id = p.get("id", "")
                     break
-        return self._decision(action_type, target_id=target_id, reasoning=result["reasoning"])
+        return self._decision(action_type, target_id=target_id, reasoning=result.get("reasoning", ""))
 
     def _resolve_target(self, name: str) -> Optional[str]:
         """Resolve player name to player id."""

@@ -99,6 +99,8 @@ def run_one_game(seed: int, strict: bool) -> dict[str, Any]:
         )
 
     document = generate_published_review_document(state)
+    from backend.db.persist import save_published_review
+    save_published_review(state)
     review_report = document.review_report
     validation = document.validation_result
 
@@ -383,13 +385,14 @@ def _run_llm_ab_seed(
     """
     LLMAgent.STRICT_NO_FALLBACK = strict
     strategy_bias = TournamentRunner._patch_ops_to_bias(strategy_patch_ops or [])
+    role_models = {target_role: {"strategy_bias": strategy_bias}} if target_role and strategy_bias else {}
     players = build_players(seed=seed)
     agents = create_agents(
         players,
         {
             "type": "llm",
             "seed": seed,
-            "strategy_bias": strategy_bias,
+            "role_models": role_models,
             "temperature": 0.4,
             "speech_temperature": 1.1,
         },
@@ -399,7 +402,7 @@ def _run_llm_ab_seed(
         agents=agents,
         seed=seed,
         strategy_version=strategy_version,
-        strategy_bias=strategy_bias,
+        strategy_bias_by_role={target_role: strategy_bias} if target_role and strategy_bias else {},
     )
     state = game.play()
     metric = MetricsCalculator().compute(state)

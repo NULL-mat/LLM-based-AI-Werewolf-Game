@@ -69,6 +69,9 @@ def _spec_for_provider(provider: str, model: str) -> dict[str, str] | None:
     elif provider == "deepseek":
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+    elif provider in {"mimo", "local_mimo"}:
+        api_key = os.getenv("MIMO_API_KEY", "local").strip()
+        base_url = os.getenv("MIMO_BASE_URL", "").strip()
     else:
         api_key = os.getenv("DOUBAO_API_KEY", "").strip()
         base_url = os.getenv("DOUBAO_BASE_URL", "").strip()
@@ -105,7 +108,7 @@ def _create_llm_runnable(
             "is unavailable. LLM-only games refuse heuristic fallback; configure an API key "
             "or set LLM_PROVIDER=fake for local tests."
         )
-    client.timeout = 300.0
+    client.timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
     return create_llm_from_client(client)
 
 

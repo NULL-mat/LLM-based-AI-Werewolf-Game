@@ -18,12 +18,54 @@ def test_create_client_defaults_to_dsv4flash(monkeypatch) -> None:
     for var in ("LLM_PROVIDER", "DSV4FLASH_API_KEY", "DSV4FLASH_BASE_URL", "DSV4FLASH_MODEL",
                 "DOUBAO_API_KEY", "ARK_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                 "DOUBAO_ENDPOINT", "DOUBAO_MODEL", "ANTHROPIC_MODEL", "DOUBAO_BASE_URL",
-                "ARK_BASE_URL", "ANTHROPIC_BASE_URL"):
+                "ARK_BASE_URL", "ANTHROPIC_BASE_URL", "MIMO_BASE_URL", "MIMO_MODEL",
+                "MIMO_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("DSV4FLASH_API_KEY", "test-key")
     client = create_client(provider=None)
     assert client.provider == "dsv4flash"
     assert client.model == "deepseek-v4-flash"
+
+
+def test_create_client_mimo_requires_base_url(monkeypatch) -> None:
+    monkeypatch.setattr("backend.llm.load_env_file", lambda *a, **k: None)
+    monkeypatch.delenv("MIMO_BASE_URL", raising=False)
+    client = create_client(provider="mimo")
+
+    assert client.provider == "mimo"
+    assert client.available is False
+
+
+def test_create_client_mimo_uses_openai_compatible_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr("backend.llm.load_env_file", lambda *a, **k: None)
+    monkeypatch.setenv("MIMO_BASE_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setenv("MIMO_MODEL", "mimo-test")
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
+
+    client = create_client(provider="mimo")
+
+    assert client.provider == "mimo"
+    assert client.base_url == "http://127.0.0.1:8001/v1"
+    assert client.model == "mimo-test"
+    assert client.api_key == "local"
+
+
+def test_fake_llm_uses_public_pressure_when_target_is_legal() -> None:
+    client = create_client(provider="fake")
+    prompt = (
+        "=== 当前状态 ===\n"
+        "你是 3号:Carol，身份=Villager\n"
+        "合法目标：1号:Alice，2号:Bob，4号:Dave\n"
+        "=== 今日发言 ===\n"
+        "1号:Alice：我是预言家，查杀 Bob，今天归票 Bob。\n"
+        "【任务：投票】\n"
+        "选择一个存活玩家投票放逐。\n"
+    )
+
+    response = client.chat_sync([{"role": "user", "content": prompt}])
+
+    content = response["choices"][0]["message"]["content"]
+    assert '"target": "Bob"' in content
 
 
 def test_create_agents_applies_role_model_overrides() -> None:

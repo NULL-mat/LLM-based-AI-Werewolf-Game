@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -65,7 +66,7 @@ def create_cognitive_agent(
         if llm_provider:
             from backend.llm import create_client
             client = create_client(provider=llm_provider, model=llm_model or None)
-            client.timeout = 300.0
+            client.timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
             llm = create_llm_from_client(client)
         else:
             raise ValueError(
@@ -142,7 +143,7 @@ class _ToolCallingRunnable(Runnable):
             api_messages.append(entry)
 
         # Build call parameters explicitly (avoid **payload issues with httpx serialization)
-        max_tokens = kwargs.get("max_tokens", 800)
+        max_tokens = kwargs.get("max_tokens", 8000)
         temperature = kwargs.get("temperature", 0.7)
         tools = self._tool_schemas if self._tool_schemas else None
 

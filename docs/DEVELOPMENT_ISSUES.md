@@ -2,8 +2,8 @@
 name: development-issues
 description: AI Werewolf 开发过程中真实遇到的问题、根因定位与解决方案；本文件由 AI 与人类持续追加
 audience: claude, codex, human
-version: 1.0.0
-updated: 2026-05-23
+version: 1.2.0
+updated: 2026-06-03
 ---
 
 # 开发问题追踪与解决方案
@@ -133,6 +133,14 @@ updated: 2026-05-23
 - **教训**：阶段流测试的脚本 Agent 必须覆盖当前调度入口；引擎从顺序调用改成批量调用后，只替换 `_ask()` 不再等于控制了所有 Agent 决策。
 
 ---
+
+### 问题 A11：LLM 无效目标被引擎兜底
+- **发生时间 / Session**：2026-06-03 ｜ Codex
+- **现象**：LLM-only 验收时发现白天投票、警长投票、警徽移交等阶段如果 LLM 给出非法目标，引擎仍可能静默选第一个合法目标继续推进；这会让“全 LLM 决策”看似通过，实际掺入硬兜底。
+- **根因**：严格 LLM 模式缺少统一的“非法 LLM 决策即失败”路径；同时 `PlayerView` 没有把合法目标显式给到认知 agent，agent 只能从存活玩家文本中猜。
+- **解决方案**：为 AI LLM/Cognitive seat 增加 strict invalid decision raise；`Visibility` 输出 `legal_targets`，`Observation/format_observation` 显示合法目标，决策审计优先记录真实候选动作；fake/offline LLM 也优先从合法目标中选。
+- **涉及文件 / 模块**：`backend/engine/game.py`、`backend/engine/visibility.py`、`backend/agents/cognitive/observe.py`、`backend/agents/cognitive/agent_loop.py`、`backend/llm/__init__.py`、`tests/test_engine.py`、`tests/test_cognitive_offline.py`
+- **教训**：LLM-only 不只是“调用了 LLM”，还必须做到非法输出不能被引擎改写；合法动作集合必须进入最终 agent input 和审计记录。
 
 ## §B. 前端 / UI 渲染
 
@@ -462,6 +470,46 @@ updated: 2026-05-23
 
 ---
 
+### 问题 C21：C Track 策略未进入认知 Prompt
+- **发生时间 / Session**：2026-06-03 ｜ Codex
+- **现象**：`run_full_llm_pipeline.py` 的 A/B tournament 能把 candidate patch 标记为 applied，但 baseline/candidate 分数与胜局完全相同，`accepted=False`；说明策略版本没有真实影响 agent 行为。
+- **根因**：`CognitiveAgent` 收到了 `strategy_bias`，但主路径 `AgentLoop._build_system_text()` 没有把 `build_strategy_bias_block()` 拼进 prompt；同时 A/B 脚本把 Seer 策略作为全局策略给所有角色，而不是只注入目标角色。
+- **解决方案**：在 AgentLoop 的任务后追加策略层强制规则块；A/B 路径改为按 `target_role` 注入 `strategy_bias_by_role/role_models`；fake LLM 在看到策略层规则、预言家私有查验、公开票压时才改变模型输出，engine 不改分、不硬改动作。
+- **涉及文件 / 模块**：`backend/agents/cognitive/agent_loop.py`、`backend/eval/evolution.py`、`scripts/run_full_llm_pipeline.py`、`backend/llm/__init__.py`、`tests/test_prompt_layering.py`、`tests/test_llm_config.py`
+- **教训**：Track C 的“策略产生了”不等于“策略进入了 agent 输入”；A/B 验收必须证明独立变量在目标角色 prompt 中可见并能影响事件。
+
+### 问题 C22：预言家查验未进认知观察
+- **发生时间 / Session**：2026-06-03 ｜ Codex
+- **现象**：C Track 生成“公开查杀/转化投票压力”类策略后，预言家仍无法稳定执行；复盘里反复出现查到狼却未公开、未投查杀目标的问题。
+- **根因**：引擎写入的私有事件 payload 是 `{"kind": "seer_result", "target_name": ..., "is_wolf": ...}`，但 `observe()` 只识别旧字段 `check_result`，导致 cognitive observation 丢掉真实查验结果。
+- **解决方案**：`observe()` 兼容 `kind == "seer_result"` 并写入 `obs.private["seer_check"]`；新增单测锁住引擎实际 payload 形状。
+- **涉及文件 / 模块**：`backend/agents/cognitive/observe.py`、`tests/test_cognitive_offline.py`、`backend/engine/game.py`
+- **教训**：信息隔离正确还不够，私有信息必须被认知层按真实 schema 消费；字段名漂移会让角色能力看起来“不会玩”。
+
+### 问题 C23：反思文档为空且来源 unknown
+- **发生时间 / Session**：2026-06-03 ｜ Codex
+- **现象**：LLM 批量对局后日志出现 `reflection produced no new docs`，PG 中缺少 C Track 角色反思文档；部分旧反思文档 `source_report_ids=["unknown"]`。
+- **根因**：fake LLM 先匹配通用“输出 JSON”分支，复盘 prompt 返回了 `{target, reasoning}` 而不是反思 schema；`Reflector` 对空数组静默返回 0 doc；`CognitiveAgent` 初始化未拿到 `game_id`。
+- **解决方案**：fake LLM 先识别复盘任务并返回反思 schema；`Reflector` 对空复盘生成低置信 fallback docs；`WerewolfGame.initialize()` 与 `PlayerView` 传递真实 `game_id`。
+- **涉及文件 / 模块**：`backend/llm/__init__.py`、`backend/agents/cognitive/reflect.py`、`backend/engine/game.py`、`backend/engine/visibility.py`、`tests/test_cognitive_offline.py`
+- **教训**：自进化链路不能把“LLM 返回可解析 JSON”当作“有知识产出”；空复盘必须告警或降级生成可审计低置信文档，且 source id 必须贯通。
+
+### 问题 C24：反例优化把硬玩法塞回非策略层
+- **发生时间 / Session**：2026-06-04 ｜ Codex
+- **现象**：最新增量补丁在 `build_think_prompt()` 和 `AgentLoop._task_for_action()` 中注入了 `_ROLE_ANTI_PATTERNS`，包含“查到狼人必须”“跟随预言家”“首夜优先守护”“刀人优先级”等硬策略，违反用户反复强调的“只有策略层可以教玩法”。
+- **根因**：为了闭合 Track C 反例反馈，直接把 MetricsCalculator 常见失误硬编码进角色思考/任务提示；这绕过了策略知识库，也让 role/persona/task 层重新承担玩法教学。
+- **解决方案**：删除 `_ROLE_ANTI_PATTERNS` 与 `get_role_anti_patterns()`，`build_think_prompt()` 只接收外部 `strategy_text/strategy_bias`；`AgentLoop` 新增独立 `【策略层：Track C 复盘知识】` 块，只从已发布策略知识库检索经验后注入；新增分层测试防止硬策略短语回流到非策略层。
+- **涉及文件 / 模块**：`backend/agents/cognitive/prompts.py`、`backend/agents/cognitive/agent_loop.py`、`tests/test_prompt_layering.py`
+- **教训**：Track C 反馈闭环不能靠代码里写死角色打法；反例、建议、避免项都必须经过策略层和可审计知识库进入 Prompt。
+
+### 问题 C25：Prompt 构造期重检索拖慢 LLM-only 对局
+- **发生时间 / Session**：2026-06-04 ｜ Codex
+- **现象**：尝试在每次 `AgentLoop._build_system_text()` 中走完整 Track C/RAG 检索后，fake LLM 对局也出现长时间 CPU 占用，单局 20-60 秒仍不能稳定完成。
+- **根因**：Prompt 构造是高频路径；完整检索链路会触发较重的知识恢复、排序和兼容处理，本应服务于离线评测/检索 API，不适合每个 agent 每个动作同步执行。
+- **解决方案**：改为轻量 SQL 读取 `list_strategy_knowledge(role, phase, status="active", limit=3)`，不足时补 role-only active 文档；增加短 TTL 进程缓存 `TRACK_C_AUTO_RETRIEVAL_CACHE_SECONDS`，保持策略层注入可用但不拖垮对局推进。
+- **涉及文件 / 模块**：`backend/agents/cognitive/agent_loop.py`、`backend/db/persist.py`、`tests/test_prompt_layering.py`
+- **教训**：自进化知识进入在线决策时必须控制延迟边界；在线 Prompt 拼装只读已经沉淀的轻量结果，重排序和候选生成留给 Track C 离线链路。
+
 ## §D. 数据库 / 持久化
 
 ### 问题 D1：以为在用 PostgreSQL，其实是 SQLite
@@ -520,6 +568,22 @@ updated: 2026-05-23
 - **教训**：聚合接口的 `limit` 必须约束数据库查询，不应只约束返回 JSON；本地验收库会长期增长，不能假设数据量小。
 
 ---
+
+### 问题 D8：Track C 报告类型不兼容
+- **发生时间 / Session**：2026-06-03 ｜ Codex
+- **现象**：5 局 B/C 主流程已发布复盘，但 DreamJob 汇总阶段崩溃：`TypeError: 'ReviewReport' object is not iterable`，Track C 无法从 DB 重建的 Track B 报告继续抽取策略卡。
+- **根因**：项目里同时存在 `backend.eval.review.ReviewReport` 与 `backend.eval.types.ReviewReport`；`StrategyKnowledgeExtractor.extract()` 只用 `isinstance(reports, review.ReviewReport)` 判断单报告，DB 重建返回的是 `types.ReviewReport`，被误当成 sequence。
+- **解决方案**：抽取器入口改为按报告字段形状识别单个 ReviewReport-like 对象；新增 `types.ReviewReport` 单报告输入回归测试。
+- **涉及文件 / 模块**：`backend/eval/review.py`、`tests/test_track_c_evolution.py`、`backend/eval/types.py`、`backend/eval/evolution.py`
+- **教训**：跨模块 dataclass 去重前，公共 API 不能只靠类身份判断；DB 重建对象尤其要做 shape-compatible 输入测试。
+
+### 问题 D9：全流程脚本生成复盘但未显式落库
+- **发生时间 / Session**：2026-06-04 ｜ Codex
+- **现象**：`run_full_llm_pipeline.py` 跑 5 局时内存态显示 5/5 `approved` 且 `publish=True`，但随后 Track C 只读取到 4 份 published review，导致 `track_c.games=4`。
+- **根因**：脚本只调用 `generate_published_review_document(state)` 取得内存文档，未在该路径显式调用 `save_published_review(state)`；部分 seed 的复盘没有进入持久化表，Track C 从 DB 汇总时样本缺失。
+- **解决方案**：在生成复盘文档后立即调用 `save_published_review(state)`，确保 B/C 主流程的复盘报告与后续 Track C DB 输入一致；复跑 5 局后 `track_c.games=5`。
+- **涉及文件 / 模块**：`scripts/run_full_llm_pipeline.py`、`backend/db/persist.py`、`backend/eval/review.py`
+- **教训**：全链路验收不能只看内存对象通过；只要下一阶段从数据库读，就必须在阶段边界显式落库并校验样本数一致。
 
 ## §E. WebSocket / 实时通信
 
@@ -724,6 +788,7 @@ updated: 2026-05-23
 - **最终实验必须带 LLM 来源证明** —— heuristic smoke 只验流程；正式结论必须由 `scripts/run_full_llm_pipeline.py` 产生，并包含 `runner_mode=llm`、`llm_decision_count`、`fallback_count=0` 等审计字段。
 - **【2026-06-03 纠正】所有对局都必须是 LLM-only，不要启发式** —— 即使是本地 smoke / A-B tournament / human mixed room，AI 席位也必须走 LLM-compatible Agent；离线测试只能用 `LLM_PROVIDER=fake` 这种 LLM 接口 stub，不能用 `HeuristicAgent` 代替。
 - **【2026-06-03 纠正】只有策略层可以教玩法** —— persona/角色性格层只描述表达和性格；role/system 层只描述职业目标、能力、规则和信息边界；“什么时候该做什么、优先级、跳身份、刀口、归票”等必须只出现在策略层。
+- **【2026-06-03 纠正】MBTI 覆盖必须是 16×20 局** —— “每个 MBTI 跑 20 局”不能用“总共 20 局且角色覆盖”代替；正式验收至少应跑 16 种 MBTI × 20 局 = 320 局，并按 MBTI 输出 game_count / win_rate / fallback / invalid / 入库统计。
 - **豆包 embedding 必须用 endpoint ID** —— `doubao-embedding-vision` Model ID 在个人 API 下可能 404；正式 RAG 验收必须配置 embedding 专用 `DOUBAO_EMBEDDING_ENDPOINT=ep-...`。
 
 ### 关于 UI / UX
@@ -761,4 +826,4 @@ updated: 2026-05-23
 
 ---
 
-*Version 1.1.0 — 2026-06-01 — 新增 A9 Agent 并行化优化。*
+*Version 1.2.0 — 2026-06-03 — 新增 LLM-only / C Track / 反思文档 / 报告类型兼容问题闭环。*
