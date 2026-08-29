@@ -11,7 +11,7 @@ Fallback: SQL metadata matching if vector index unavailable.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -296,21 +296,37 @@ def format_strategies_for_prompt(strategies: List[Dict[str, str]]) -> str:
 # ============================================================
 
 def _load_docs_from_pg(conn_str: str) -> List[Dict[str, Any]]:
-    """Load all active strategy documents from PostgreSQL (now includes persona_scope)."""
+    """Load all active strategy documents from PostgreSQL (now includes persona_scope + experiment_id filter for tier isolation)."""
+    import os as _os
     import psycopg2
     conn = psycopg2.connect(conn_str)
     c = conn.cursor()
-    c.execute("""
-        SELECT COALESCE(situation_pattern, ''),
-               COALESCE(recommended_action, ''),
-               COALESCE(rationale, ''),
-               role, phase, quality_score,
-               COALESCE(persona_scope, ''),
-               COALESCE(doc_type, '')
-        FROM strategy_knowledge_docs
-        WHERE status = 'active'
-          AND (doc_type != 'reflection' OR quality_score >= 0.85)
-    """)
+    exp_id = _os.getenv("TIER_EXPERIMENT_ID", "")
+    if exp_id:
+        c.execute("""
+            SELECT COALESCE(situation_pattern, ''),
+                   COALESCE(recommended_action, ''),
+                   COALESCE(rationale, ''),
+                   role, phase, quality_score,
+                   COALESCE(persona_scope, ''),
+                   COALESCE(doc_type, '')
+            FROM strategy_knowledge_docs
+            WHERE status = 'active'
+              AND (doc_type != 'reflection' OR quality_score >= 0.85)
+              AND (experiment_id = %s OR experiment_id IS NULL)
+        """, (exp_id,))
+    else:
+        c.execute("""
+            SELECT COALESCE(situation_pattern, ''),
+                   COALESCE(recommended_action, ''),
+                   COALESCE(rationale, ''),
+                   role, phase, quality_score,
+                   COALESCE(persona_scope, ''),
+                   COALESCE(doc_type, '')
+            FROM strategy_knowledge_docs
+            WHERE status = 'active'
+              AND (doc_type != 'reflection' OR quality_score >= 0.85)
+        """)
     docs = []
     for sit, rec, rat, role, phase, q, pscope, dtype in c.fetchall():
         docs.append({

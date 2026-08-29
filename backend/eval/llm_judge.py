@@ -66,6 +66,7 @@ class PerStepScore:
     reasoning_depth: float   # 0-10: was the reasoning sound?
     overall: float
     evidence: list[str]
+    judge_agreement: float = 0.0  # std across judges for panel scoring
     rubric_version: str = RUBRIC_VERSION
 
 
@@ -115,14 +116,16 @@ class LLMJudgePanel:
             if not reports:
                 continue
 
-            # Trimmed mean: drop highest and lowest if we have 3 judges
-            scores_list = [r.overall_score for r in reports]
-            if len(scores_list) >= 3:
-                scores_list.sort()
-                composite = scores_list[1]  # median of 3
-            else:
-                composite = statistics.mean(scores_list)
+            # Critic round: review judge disagreement, produce adjusted composite
+            critic_result = self._critic_review(reports, {"player_name": name, "role": role})
+            composite = critic_result["final_score"]
+            if critic_result.get("adjusted"):
+                logger.info(
+                    f"Critic adjusted {name}({role}) composite={composite:.2f} "
+                    f"(disagreement={critic_result.get('disagreement', 0):.2f})"
+                )
 
+            scores_list = [r.overall_score for r in reports]
             judge_agreement = statistics.stdev(scores_list) if len(scores_list) >= 2 else 0.0
 
             strategy_score = next((r.overall_score for r in reports if r.judge_type == "strategist"), 5.0)
@@ -170,6 +173,71 @@ class LLMJudgePanel:
             overall_score=statistics.mean([v.score for v in parsed]) if parsed else 5.0,
         )
 
+    # ---- Critic Round (adversarial validation) ----
+
+    def _critic_review(self, judge_results: list[JudgeReport], game_data: dict) -> dict:
+        """Critic reviews judge disagreement and recommends score adjustment."""
+        if len(judge_results) < 3:
+            scores = [r.overall_score for r in judge_results]
+            return {"adjusted": False, "final_score": sum(scores) / max(len(scores), 1)}
+
+        # Build judge info: (judge_type, overall_score, reasoning_summary)
+        judge_info = []
+        for r in judge_results:
+            reasoning_snippets = " | ".join(v.reasoning[:80] for v in r.verdicts[:2])
+            judge_info.append((r.judge_type, r.overall_score, reasoning_snippets))
+
+        # Sort by score for trimmed mean
+        judge_info.sort(key=lambda x: x[1])
+        scores = [x[1] for x in judge_info]
+
+        # Trimmed mean: drop highest and lowest
+        trimmed_mean = scores[1] if len(scores) == 3 else sum(scores[1:-1]) / (len(scores) - 2)
+
+        disagreement = max(scores) - min(scores)
+        if disagreement <= 0.3:
+            return {"adjusted": False, "final_score": trimmed_mean, "disagreement": round(disagreement, 3)}
+
+        # Build Critic prompt
+        player_name = game_data.get("player_name", "unknown")
+        role = game_data.get("role", "unknown")
+
+        judge_lines = []
+        for jtype, score, snippet in judge_info:
+            judge_lines.append(f"- {_judge_label(jtype)}: {score:.2f} — {snippet}")
+
+        system_prompt = (
+            "你是狼人杀评分Critic（批评家），负责审查三位裁判的评分是否存在分歧过大，"
+            "并根据推理质量给出调整后的分数。只输出JSON，不要额外解释。"
+        )
+
+        critic_prompt = f"""三位裁判对玩家 {player_name}({role})的评分存在较大分歧:
+
+{chr(10).join(judge_lines)}
+
+最大分歧: {disagreement:.2f}。请审查各裁判的推理，给出你认可的调整分数。
+
+返回JSON格式: {{"adjusted_score": <0-10>, "reasoning": "<简述为何这样调整>"}}"""
+
+        try:
+            response = self._call_llm(system_prompt, critic_prompt, max_tokens=500)
+            critic_data = self._parse_step_output(response)
+            if critic_data:
+                critic_score = float(critic_data.get("adjusted_score", trimmed_mean))
+                # Weight critic at 25%, trimmed mean at 75%
+                final = trimmed_mean * 0.75 + critic_score * 0.25
+                return {
+                    "adjusted": True, "final_score": round(final, 3),
+                    "disagreement": round(disagreement, 3),
+                    "critic_score": critic_score,
+                    "critic_reasoning": critic_data.get("reasoning", ""),
+                }
+            else:
+                return {"adjusted": False, "final_score": trimmed_mean, "disagreement": round(disagreement, 3)}
+        except Exception as e:
+            logger.warning(f"Critic review failed: {e}")
+            return {"adjusted": False, "final_score": trimmed_mean, "disagreement": round(disagreement, 3)}
+
     # ---- Per-Step Scoring (lightweight, single judge) ----
 
     def score_step(
@@ -203,7 +271,54 @@ class LLMJudgePanel:
             )
         return None
 
-    # ---- Internal ----
+    def score_step_with_panel(
+        self, decision: dict, game_context: dict,
+    ) -> PerStepScore | None:
+        """Score a single decision using the full 3-judge panel with per-step rubric.
+
+        Uses all 3 judges independently scoring the same decision, then
+        trimmed-mean aggregation. Higher confidence than single-judge score_step.
+        """
+        scores = []
+        for judge_type, _ in self._judges.items():
+            prompt = _build_per_step_prompt(decision, game_context, PER_STEP_RUBRIC)
+            system = (
+                f"你是狼人杀{_judge_label(judge_type)}。"
+                f"请根据量规对这个单独的决策进行评分。"
+                f"注意：只基于该玩家当时能看到的信息，而非全局信息。"
+                f"输出严格的JSON格式。"
+            )
+            raw = self._call_llm(system, prompt, max_tokens=500)
+            parsed = self._parse_step_output(raw)
+            if parsed:
+                scores.append((parsed.get("T1_score", 5.0) + parsed.get("T2_score", 5.0)) / 2)
+            else:
+                scores.append(5.0)
+
+        if not scores:
+            return None
+
+        # Trimmed mean: drop min and max when 3 scores
+        if len(scores) >= 3:
+            scores_sorted = sorted(scores)
+            trimmed_mean = scores_sorted[1]
+        else:
+            trimmed_mean = sum(scores) / len(scores)
+
+        judge_agreement = statistics.stdev(scores) if len(scores) >= 2 else 0.0
+
+        return PerStepScore(
+            decision_id=decision.get("id", ""),
+            player_name=decision.get("player_name", ""),
+            action_type=decision.get("action_type", "?"),
+            day=decision.get("day", 0),
+            phase=decision.get("phase", ""),
+            reasonability=trimmed_mean,
+            reasoning_depth=trimmed_mean,
+            overall=trimmed_mean,
+            evidence=[],
+            judge_agreement=judge_agreement,
+        )
 
     def _call_llm(self, system: str, user: str, max_tokens: int = 800) -> str:
         """Call the LLM client."""

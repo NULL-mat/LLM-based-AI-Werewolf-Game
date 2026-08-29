@@ -39,6 +39,8 @@ from backend.agents.cognitive.tools import create_tools
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
+import threading as _threading
+_STRATEGY_LOCK = _threading.Lock()
 _TRACK_C_RETRIEVAL_CACHE: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
 _LAST_RETRIEVED_STRATEGIES: dict = {}
 _LAST_LOOP_TRACE: dict = {}
@@ -130,6 +132,16 @@ _TOOL_PARAM_SCHEMAS: Dict[str, Dict] = {
 }
 
 
+_WOLF_ROLES_LOOP = {"Werewolf", "WhiteWolfKing", "BigBadWolf", "WolfCub", "AlphaWolf"}
+
+
+def _derive_alignment(role: str) -> str:
+    """Derive alignment from role name. Returns 'wolf' or 'village'."""
+    if not role:
+        return ""
+    return "wolf" if role.strip() in _WOLF_ROLES_LOOP else "village"
+
+
 class AgentLoop:
     """Autonomous tool-calling agent loop for AI Werewolf.
 
@@ -146,11 +158,17 @@ class AgentLoop:
         action_type: str = "speech",
         strategy_bias: Optional[Dict[str, List[str]]] = None,
         temperature: Optional[float] = None,
+        mbti: str = "",
+        player_id: str = "",
+        retrieval_policy: str = "",
     ):
         self._llm = llm
         self._system_prompt = system_prompt
         self._action_type = action_type
         self._strategy_bias = strategy_bias or {}
+        self._mbti = mbti
+        self._player_id = player_id
+        self._retrieval_policy = retrieval_policy
         self._temperature = temperature
         # Native function calling via bind_tools is supported by the LLM wrapper
         # but currently disabled by default. Direct API tests confirm tools work,
@@ -189,7 +207,10 @@ class AgentLoop:
               vote:   {"target": str, "reasoning": str}
               night:  {"target": str, "reasoning": str}
         """
-        tools = create_tools(obs, memory)
+        tools = create_tools(obs, memory,
+                                mbti=self._mbti,
+                                alignment=_derive_alignment(obs.player_role),
+                                player_id=self._player_id)
         tool_schemas = self._tools_to_bind_schemas(tools) if self._supports_bind_tools else None
         context = []  # list of messages for the conversation
         tool_trace: list[dict] = []  # track tool calls for auditing
@@ -227,13 +248,31 @@ class AgentLoop:
                 tool_keywords = self._extract_tool_keywords(response, is_native)
                 for idx, tr in enumerate(tool_results):
                     tname = tool_names[idx] if idx < len(tool_names) else "unknown"
+                    # Extract doc_ids from formatted strategy output
+                    doc_ids = re.findall(r'\[([\w\-]+)\s+score=', tr) if tname == 'search_strategies' else []
                     tool_trace.append({
                         "iteration": iteration,
                         "tool": tname,
                         "keywords": tool_keywords.get(tname, []),
+                        "doc_ids": doc_ids,
                         "timestamp": time.time(),
                         "result_summary": tr[:200],
+                        "policy": self._retrieval_policy,
+                        "mbti": self._mbti,
+                        "role": obs.player_role,
                     })
+                    # Populate _LAST_RETRIEVED_STRATEGIES for search_strategies tool calls
+                    # so _record_strategy_usage() can track which docs were actually retrieved.
+                    # Merge with auto-injected entries (if any) rather than overwriting.
+                    if tname == 'search_strategies' and doc_ids:
+                        player_id = str(getattr(obs, "player_id", "") or "")
+                        with _STRATEGY_LOCK:
+                            existing = _LAST_RETRIEVED_STRATEGIES.get(player_id, [])
+                            existing_ids = {s.get("doc_id", "") for s in existing}
+                            for d in doc_ids:
+                                if d and d not in existing_ids:
+                                    existing.append({"doc_id": d})
+                            _LAST_RETRIEVED_STRATEGIES[player_id] = existing
 
                 # Add assistant response + tool results to context
                 if is_native:
@@ -671,14 +710,27 @@ class AgentLoop:
         """Inject tool trace and auto-injected strategy IDs into the decision dict."""
         decision["_tool_trace"] = tool_trace
         player_id = str(getattr(obs, "player_id", "") or "")
-        auto_injected = _LAST_RETRIEVED_STRATEGIES.pop(player_id, [])
+        with _STRATEGY_LOCK:
+            auto_injected = _LAST_RETRIEVED_STRATEGIES.pop(player_id, [])
         decision["_auto_injected_strategies"] = [
             s.get("doc_id", "") for s in auto_injected
         ]
-        _LAST_LOOP_TRACE[player_id] = {
-            "tool_trace": tool_trace,
-            "auto_injected_strategies": decision["_auto_injected_strategies"],
-        }
+        # Extract tool-called strategy doc_ids from the tool trace and merge
+        tool_called_ids: list[str] = []
+        for entry in tool_trace:
+            if entry.get("tool") == "search_strategies":
+                for did in entry.get("doc_ids", []):
+                    if did and did not in tool_called_ids:
+                        tool_called_ids.append(did)
+        merged_ids = list(dict.fromkeys(
+            decision["_auto_injected_strategies"] + tool_called_ids
+        ))
+        with _STRATEGY_LOCK:
+            _LAST_LOOP_TRACE[player_id] = {
+                "tool_trace": tool_trace,
+                "auto_injected_strategies": decision["_auto_injected_strategies"],
+                "retrieved_knowledge_ids": merged_ids,
+            }
 
     def _parse_decision(self, response: str) -> Optional[Dict[str, str]]:
         """Parse final decision from LLM response.
@@ -856,10 +908,10 @@ def _retrieve_track_c_strategy_lessons(obs: Observation, action_type: str) -> li
             now = time.monotonic()
             if cached and now - cached[0] <= cache_ttl:
                 return [dict(row) for row in cached[1]]
-        rows = list_strategy_knowledge(role=role, phase=phase, status="active", limit=3)
+        rows = list_strategy_knowledge(role=role, phase=phase, status=None, limit=3)
         if len(rows) < 3:
             seen = {str(row.get("doc_id") or row.get("id") or "") for row in rows}
-            for row in list_strategy_knowledge(role=role, status="active", limit=6):
+            for row in list_strategy_knowledge(role=role, status=None, limit=6):
                 row_id = str(row.get("doc_id") or row.get("id") or "")
                 if row_id and row_id not in seen:
                     rows.append(row)
@@ -871,7 +923,8 @@ def _retrieve_track_c_strategy_lessons(obs: Observation, action_type: str) -> li
             _TRACK_C_RETRIEVAL_CACHE[cache_key] = (time.monotonic(), lessons)
         if lessons:
             player_id = str(getattr(obs, "player_id", "") or "")
-            _LAST_RETRIEVED_STRATEGIES[player_id] = lessons
+            with _STRATEGY_LOCK:
+                _LAST_RETRIEVED_STRATEGIES[player_id] = lessons
         elif os.getenv("REQUIRE_STRATEGY_USAGE_TRACE", "").lower() == "true":
             logger.error("STRICT FAIL: Track C auto-retrieval returned no strategies")
         return lessons

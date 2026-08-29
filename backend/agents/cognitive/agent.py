@@ -146,20 +146,6 @@ class CognitiveAgent:
                     if w.get("id", w.get("player_id", "")) != self.player_id
                 ]
                 alive_ids = [p["id"] for p in view.players if p.get("alive")]
-                try:
-                    from backend.agents.cognitive.wolf_team import assign_wolf_tactics
-                    self._wolf_tactics = assign_wolf_tactics(
-                        all_wolf_ids,
-                        {"alive_player_ids": alive_ids},
-                    )
-                except Exception:
-                    import logging
-                    _logger = logging.getLogger(__name__)
-                    _logger.warning(
-                        f"assign_wolf_tactics failed for {self.player_name}, "
-                        f"using empty tactics", exc_info=True
-                    )
-                    self._wolf_tactics = {}
 
     def update(self, view: Any, request: str) -> None:
         self._view = view
@@ -574,9 +560,12 @@ class CognitiveAgent:
                 if trace.get("auto_injected_strategies"):
                     meta["_auto_injected_strategies"] = trace["auto_injected_strategies"]
                     meta["retrieval_used"] = True
-                    meta["retrieved_knowledge_ids"] = trace["auto_injected_strategies"]
-                # Best-effort: record knowledge usage for each auto-injected strategy
-                self._record_strategy_usage(trace.get("auto_injected_strategies", []))
+                # Use merged retrieved_knowledge_ids (auto-injected + tool-called) if available
+                merged = trace.get("retrieved_knowledge_ids", trace.get("auto_injected_strategies", []))
+                if merged:
+                    meta["retrieved_knowledge_ids"] = merged
+                # Best-effort: record knowledge usage for all retrieved strategies
+                self._record_strategy_usage(merged)
         except Exception:
             pass  # trace injection is best-effort
 
