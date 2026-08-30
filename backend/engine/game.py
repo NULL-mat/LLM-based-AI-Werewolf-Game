@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import time
 from collections import Counter
 from random import Random
@@ -141,7 +145,7 @@ class WerewolfGame:
             or create_agents(
                 self.state.players,
                 {
-                    "type": "heuristic",
+                    "type": "llm",
                     "seed": seed or 0,
                     "temperature": 0.4,
                     "character_map": self.characters,
@@ -735,7 +739,11 @@ class WerewolfGame:
         self._set_phase(Phase.DAY_SPEECH)
 
         def handle(player: Player) -> None:
-            decision = self._ask(player, "TALK", lambda agent: agent.talk())
+            try:
+                decision = self._ask(player, "TALK", lambda agent: agent.talk())
+            except Exception:
+                logger.exception(f"Speech failed for {player.name} (seat={player.seat}), skipping")
+                return
             if not self.validator.validate(self.state, decision):
                 return
             self._emit_speech(player, decision, {})
@@ -755,7 +763,11 @@ class WerewolfGame:
         self._log(EventType.SYSTEM_MESSAGE, "public", {"message": f"Vote tie. PK speeches between {names}."})
 
         def handle(player: Player) -> None:
-            decision = self._ask(player, "TALK", lambda agent: agent.talk())
+            try:
+                decision = self._ask(player, "TALK", lambda agent: agent.talk())
+            except Exception:
+                logger.exception(f"PK speech failed for {player.name} (seat={player.seat}), skipping")
+                return
             if not self.validator.validate(self.state, decision):
                 return
             self._emit_speech(player, decision, {"pk_speech": True})
@@ -1337,7 +1349,15 @@ class WerewolfGame:
             player = players[index]
             self.state.phase_cursor[cursor_key] = index
             self.state.current_speaker_id = player.id
-            handler(player)
+            try:
+                handler(player)
+            except GamePaused:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Handler failed for {player.name} (seat={player.seat}) "
+                    f"in phase {phase.value}, skipping"
+                )
         self.state.current_speaker_id = None
         self.state.phase_cursor.pop(cursor_key, None)
 
