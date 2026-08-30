@@ -40,7 +40,7 @@ const translations = {
     streamingLabel: "实时流",
     streamingDescription: "页面通过 WebSocket 接收快照，不是整局结束后再一次性渲染。",
     statusReady: "已就绪",
-    statusHint: "点击按钮生成一局新的 AI 对局。",
+    statusHint: "AI 玩家正在初始化，请稍候...",
     statusLoading: "正在生成对局",
     statusStreaming: "对局进行中",
     statusLoaded: "对局已生成",
@@ -48,6 +48,8 @@ const translations = {
     statusLoadedDetail: "已载入第 {day} 天结束的完整事件流。",
     statusError: "加载失败",
     statusErrorDetail: "接口请求失败，请确认 FastAPI 服务正在运行。",
+    viewReview: "查看复盘",
+    retry: "重试",
     requestTimeout: "请求超时，请稍后重试。",
     roomLabel: "房间",
     gameLabel: "游戏",
@@ -57,11 +59,15 @@ const translations = {
     revealRole: "查看身份",
     playerThinking: "思考中",
     playerSpeaking: "发言",
+    organizingSpeech: "正在组织语言",
+    speechPass: "（发言完毕，过）",
     sheriff: "警长",
     badgeRunning: "竞选",
     phaseAnnouncementReady: "身份已分配，对局即将开始",
     phaseAnnouncementNight: "天黑请闭眼",
     phaseAnnouncementDay: "天亮了",
+    dayHeaderSetup: "序幕",
+    dayHeaderLabel: "第 {n} 天",
     phaseAnnouncementEnd: "游戏结束",
     alive: "存活",
     dead: "出局",
@@ -86,7 +92,7 @@ const translations = {
     dayLabel: "白天",
     speakerBubble: "{name}: {text}",
     loading: "加载中",
-    readyHint: "点击「运行一局」开始观战",
+    readyHint: "对局即将开始...",
 
     lobby: "大厅",
     createRoom: "创建房间",
@@ -155,7 +161,13 @@ const translations = {
     villageWins: "好人阵营获胜",
     wolvesWin: "狼人阵营获胜",
     aliveShort: "存活",
-    eventsShort: "事件",
+    eventsShort: "复盘事件",
+    winReasonWolfParity: "狼人阵营人数已达到或超过好人阵营",
+    winReasonAllWolvesDead: "所有狼人均已出局",
+    winReasonMaxDays: "达到最大天数，狼人阵营获胜",
+    resultEntry: "本局已结束",
+    viewResult: "查看结果",
+    closePanel: "暂时关闭",
     stayOnPage: "收起面板，留在页面",
     yourTurnSpeech: "轮到你了，输入发言",
     selectTarget: "请选择目标",
@@ -186,28 +198,53 @@ const translations = {
       Knight: "骑士",
       Elder: "长老",
     },
+    // ── 聊天日志流程标签（叙述性） ──
     phases: {
       SETUP: "准备中",
-      NIGHT_START: "夜幕降临",
-      NIGHT_GUARD_ACTION: "守卫行动",
-      NIGHT_WOLF_ACTION: "狼人行动",
-      NIGHT_WITCH_ACTION: "女巫行动",
-      NIGHT_SEER_ACTION: "预言家行动",
+      NIGHT_START: "天黑请闭眼",
+      NIGHT_GUARD_ACTION: "守卫请睁眼",
+      NIGHT_WOLF_ACTION: "狼人请睁眼",
+      NIGHT_WITCH_ACTION: "女巫请睁眼",
+      NIGHT_SEER_ACTION: "预言家请睁眼",
       NIGHT_RESOLVE: "黑夜结算",
       DAY_START: "天亮了",
-      DAY_BADGE_SIGNUP: "警徽竞选报名",
+      DAY_BADGE_SIGNUP: "警徽报名",
       DAY_BADGE_SPEECH: "警徽竞选发言",
       DAY_BADGE_ELECTION: "警徽投票",
-      DAY_PK_SPEECH: "PK发言",
+      DAY_PK_SPEECH: "PK 发言",
       DAY_LAST_WORDS: "遗言",
       DAY_SPEECH: "自由发言",
       DAY_VOTE: "投票放逐",
-      DAY_RESOLVE: "投票结算",
+      DAY_RESOLVE: "白天结算",
       BADGE_TRANSFER: "警徽移交",
       HUNTER_SHOOT: "猎人开枪",
       WHITE_WOLF_KING_BOOM: "白狼王爆炸",
       GAME_END: "游戏结束",
     },
+    // ── 顶部状态栏实时标签（动作描述） ──
+    phaseStatus: {
+      NIGHT_GUARD_ACTION: "守卫行动中",
+      NIGHT_WOLF_ACTION: "狼人行动中",
+      NIGHT_WITCH_ACTION: "女巫行动中",
+      NIGHT_SEER_ACTION: "预言家行动中",
+      NIGHT_RESOLVE: "黑夜结算中",
+      BADGE_SPEECH: "警徽竞选发言中",
+      BADGE_ELECTION: "警徽投票中",
+      DAY_SPEECH: "自由发言中",
+      DAY_VOTE: "投票放逐中",
+      HUNTER_SHOOT: "猎人开枪中",
+      LAST_WORDS: "遗言中",
+    },
+    // ── 狼队商议 ──
+    wolfDiscussing: "狼人正在商议击杀目标",
+    wolfVoted: "{name} 选择击杀 {target} 号",
+    wolfFinalTarget: "狼队最终决定击杀 {target} 号 {name}",
+    wolfNoConsensus: "狼队意见不统一，随机选定击杀目标",
+    // ── 玩家动作状态模板 ──
+    playerThinkingStatus: "{seat}号 {name} 思考中",
+    playerSpeakingStatus: "{seat}号 {name} 发言中",
+    playerVotingStatus: "{seat}号 {name} 投票中",
+    playerActingStatus: "{seat}号 {name} 行动中",
   },
   [Language.EN]: {
     pageTitle: "AI Werewolf Spectator",
@@ -245,7 +282,7 @@ const translations = {
     streamingLabel: "Streaming",
     streamingDescription: "The page renders from WebSocket snapshots instead of waiting for the whole match to finish.",
     statusReady: "Ready",
-    statusHint: "Generate a new AI match from the controls.",
+    statusHint: "AI players initializing, please wait...",
     statusLoading: "Generating match",
     statusStreaming: "Match in progress",
     statusLoaded: "Match loaded",
@@ -253,6 +290,8 @@ const translations = {
     statusLoadedDetail: "Loaded a full event stream ending on day {day}.",
     statusError: "Load failed",
     statusErrorDetail: "API request failed. Confirm the FastAPI server is running.",
+    viewReview: "View Review",
+    retry: "Retry",
     requestTimeout: "Request timed out. Please try again.",
     roomLabel: "Room",
     gameLabel: "Game",
@@ -262,12 +301,16 @@ const translations = {
     revealRole: "Reveal",
     playerThinking: "Thinking",
     playerSpeaking: "Speaking",
+    organizingSpeech: "Organizing words",
+    speechPass: "(Pass)",
     sheriff: "Sheriff",
     badgeRunning: "Running",
     phaseAnnouncementReady: "Roles assigned, the match is about to begin",
     phaseAnnouncementNight: "Night falls, close your eyes",
     phaseAnnouncementDay: "Day breaks",
     phaseAnnouncementEnd: "Game Over",
+    dayHeaderSetup: "Prologue",
+    dayHeaderLabel: "Day {n}",
     alive: "Alive",
     dead: "Out",
     privateTag: "private",
@@ -291,7 +334,7 @@ const translations = {
     dayLabel: "Day",
     speakerBubble: "{name}: {text}",
     loading: "Loading",
-    readyHint: "Click \"Run Game\" to start spectating",
+    readyHint: "Match starting soon...",
 
     lobby: "Lobby",
     createRoom: "Create Room",
@@ -360,6 +403,12 @@ const translations = {
     villageWins: "Village Wins",
     wolvesWin: "Wolves Win",
     aliveShort: "Alive",
+    winReasonWolfParity: "Werewolves have reached or exceeded the village count",
+    winReasonAllWolvesDead: "All werewolves have been eliminated",
+    winReasonMaxDays: "Maximum days reached, werewolves win",
+    resultEntry: "Game Ended",
+    viewResult: "View Result",
+    closePanel: "Close",
     eventsShort: "Events",
     stayOnPage: "Dismiss, stay on page",
     yourTurnSpeech: "Your turn — type your speech",
@@ -390,28 +439,53 @@ const translations = {
       Knight: "Knight",
       Elder: "Elder",
     },
+    // ── Chat log flow labels (narrative) ──
     phases: {
       SETUP: "Setup",
       NIGHT_START: "Night Falls",
-      NIGHT_GUARD_ACTION: "Guard Action",
-      NIGHT_WOLF_ACTION: "Wolf Action",
-      NIGHT_WITCH_ACTION: "Witch Action",
-      NIGHT_SEER_ACTION: "Seer Action",
+      NIGHT_GUARD_ACTION: "Guard Awakens",
+      NIGHT_WOLF_ACTION: "Wolves Awaken",
+      NIGHT_WITCH_ACTION: "Witch Awakens",
+      NIGHT_SEER_ACTION: "Seer Awakens",
       NIGHT_RESOLVE: "Night Resolve",
       DAY_START: "Day Breaks",
-      DAY_BADGE_SIGNUP: "Badge Campaign Signup",
-      DAY_BADGE_SPEECH: "Badge Campaign Speech",
+      DAY_BADGE_SIGNUP: "Badge Signup",
+      DAY_BADGE_SPEECH: "Badge Speech",
       DAY_BADGE_ELECTION: "Badge Vote",
       DAY_PK_SPEECH: "PK Speech",
       DAY_LAST_WORDS: "Last Words",
       DAY_SPEECH: "Free Speech",
-      DAY_VOTE: "Vote Exile",
+      DAY_VOTE: "Exile Vote",
       DAY_RESOLVE: "Vote Resolve",
       BADGE_TRANSFER: "Badge Transfer",
       HUNTER_SHOOT: "Hunter Shoots",
       WHITE_WOLF_KING_BOOM: "White Wolf King Boom",
-      GAME_END: "Game End",
+      GAME_END: "Game Over",
     },
+    // ── Status bar real-time labels (action description) ──
+    phaseStatus: {
+      NIGHT_GUARD_ACTION: "Guard Acting",
+      NIGHT_WOLF_ACTION: "Wolves Acting",
+      NIGHT_WITCH_ACTION: "Witch Acting",
+      NIGHT_SEER_ACTION: "Seer Acting",
+      NIGHT_RESOLVE: "Resolving Night",
+      BADGE_SPEECH: "Badge Speech",
+      BADGE_ELECTION: "Badge Voting",
+      DAY_SPEECH: "Free Speech",
+      DAY_VOTE: "Voting",
+      HUNTER_SHOOT: "Hunter Shooting",
+      LAST_WORDS: "Last Words",
+    },
+    // ── Wolf deliberation ──
+    wolfDiscussing: "Wolves are deliberating...",
+    wolfVoted: "{name} chose to kill #{target}",
+    wolfFinalTarget: "Wolves decided to kill #{target} {name}",
+    wolfNoConsensus: "Wolves disagree, randomly selected target",
+    // ── Player action status templates ──
+    playerThinkingStatus: "#{seat} {name} thinking",
+    playerSpeakingStatus: "#{seat} {name} speaking",
+    playerVotingStatus: "#{seat} {name} voting",
+    playerActingStatus: "#{seat} {name} acting",
   },
 };
 
@@ -424,7 +498,7 @@ type TranslationKey = {
  * 获取翻译文本
  */
 export function t(key: TranslationKey, lang: Language = Language.ZH): string {
-  return translations[lang][key] || key;
+  return translations[lang][key] || translations[Language.ZH]?.[key] || key;
 }
 
 /**
@@ -450,9 +524,17 @@ export function tRole(role: string, lang: Language = Language.ZH): string {
 }
 
 /**
- * 获取阶段名称的翻译
+ * 获取阶段名称的翻译（聊天日志叙述性）
  */
 export function tPhase(phase: string, lang: Language = Language.ZH): string {
   const phases: Record<string, string> = translations[lang].phases;
   return phases[phase] || phase;
+}
+
+/**
+ * 获取阶段状态的翻译（顶部状态栏实时动作）
+ */
+export function tPhaseStatus(phase: string, lang: Language = Language.ZH): string {
+  const statuses: Record<string, string> = (translations[lang] as any).phaseStatus || {};
+  return statuses[phase] || phase;
 }

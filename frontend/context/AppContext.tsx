@@ -28,7 +28,7 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [language, setLanguage] = useState<Language>(Language.ZH);
-  const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.PUBLIC);
+  const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.MODERATOR);
   // The user wants every game LLM-driven. Heuristic remains a code path only
   // as LLMAgent's automatic fallback after 3 retry failures, never as a
   // user-selectable mode. Default to LLM and reject any URL override below.
@@ -37,7 +37,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [speed, setSpeed] = useState(80);
+  const [speed, setSpeed] = useState(800);
   const [seed, setSeed] = useState(7);
 
   // 从 URL 恢复状态
