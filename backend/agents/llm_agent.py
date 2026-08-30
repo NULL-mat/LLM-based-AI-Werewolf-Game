@@ -509,8 +509,8 @@ class LLMAgent(Agent):
     def _build_game_context(self) -> str:
         """Build wolfcha-style YAML game context."""
         view = self._view()
-        seat = view.self_player.get("seat", "?")
-        name = view.self_player.get("name", "?")
+        view.self_player.get("seat", "?")
+        view.self_player.get("name", "?")
         total_seats = len(view.players)
         day = view.day
 
@@ -1531,13 +1531,20 @@ class LLMAgent(Agent):
                     speeches.append(f"第{day}天{tag} {actor}：{speech_clean[:200]}")
                 else:
                     # Emit as multiple bubble lines for full context
-                    for i, sent in enumerate(sentences[:4]):  # Cap at 4 bubbles
+                    for _i, sent in enumerate(sentences[:4]):  # Cap at 4 bubbles
                         speeches.append(f"第{day}天{tag} {actor}：{sent[:120]}")
                     if len(sentences) > 4:
                         speeches.append(f"第{day}天{tag} {actor}：...（共{len(sentences)}句）")
             elif etype == "SYSTEM_MESSAGE":
                 msg = payload.get("message") or ""
-                if "sheriff" in msg or "警徽" in msg or "badge" in msg.lower() or "died" in msg.lower() or "出局" in msg or "deaths" in msg.lower():
+                if (
+                    "sheriff" in msg
+                    or "警徽" in msg
+                    or "badge" in msg.lower()
+                    or "died" in msg.lower()
+                    or "出局" in msg
+                    or "deaths" in msg.lower()
+                ):
                     sheriff_lines.append(f"第{day}天 系统：{msg}")
 
         lines: list[str] = []
@@ -1655,7 +1662,6 @@ class LLMAgent(Agent):
         if not self.character:
             return ""
         m = self.character.mind
-        courage_labels = {"bold": "bold", "cautious": "cautious", "calculated": "calculated"}
         lines = [
             "",
             "<hidden_player_mind>",

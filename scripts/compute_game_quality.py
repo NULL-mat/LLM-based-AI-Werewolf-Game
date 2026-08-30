@@ -260,7 +260,12 @@ def score_behavior_reason(d: dict) -> tuple[float, list[str]]:
     critical_count = 0
     for ps in pss:
         for m in ps.get("mistakes", []):
-            if isinstance(m, str) and "critical" in m.lower() or isinstance(m, dict) and m.get("severity") == "critical":
+            if (
+                isinstance(m, str)
+                and "critical" in m.lower()
+                or isinstance(m, dict)
+                and m.get("severity") == "critical"
+            ):
                 critical_count += 1
 
     if critical_count >= 2:
@@ -427,7 +432,7 @@ def main() -> None:
     print(f"  范围: [{min(scores):.1f}, {max(scores):.1f}]")
     print()
     print("  质量分布:")
-    for threshold, tier_letter, desc in QUALITY_TIERS:
+    for _threshold, tier_letter, desc in QUALITY_TIERS:
         count = tier_counts[tier_letter]
         bar = "█" * max(1, count)
         print(f"    {tier_letter} ({desc}): {count:3d} 局  {bar}")
