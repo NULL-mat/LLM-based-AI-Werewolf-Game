@@ -225,9 +225,9 @@ class CognitiveAgent:
             vote_temperature=self._humanization.vote_temperature,
         )
         target_id = self._resolve_target(result["target"])
-        # Abstention: skip voting entirely, return empty target
+        # Abstention: return empty vote as Decision (not dict)
         if not target_id:
-            return {"target": "", "reasoning": result.get("reasoning", "弃票")}
+            return self._decision(ActionType.VOTE, target_id="", reasoning=result.get("reasoning", "弃票"))
         self.memory.add_action("vote", result["target"], f"投{result['target']}", result["reasoning"])
 
         # Feed 3: Detect speech-vote mismatch and update social model
@@ -571,6 +571,14 @@ class CognitiveAgent:
                     meta["retrieved_knowledge_ids"] = merged
                 # Best-effort: record knowledge usage for all retrieved strategies
                 self._record_strategy_usage(merged)
+                # Propagate accumulated token usage from AgentLoop
+                usage = trace.get("usage", {})
+                if usage:
+                    meta["usage"] = {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                    }
         except Exception:
             pass  # trace injection is best-effort
 
