@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
-import time
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -35,6 +34,18 @@ from backend.llm.env import load_env_file
 load_env_file()
 
 logger = logging.getLogger(__name__)
+
+# Global token counter (for benchmarking)
+_GLOBAL_TOKEN_COUNTER = {"calls": 0, "input": 0, "output": 0}
+
+
+def reset_global_token_counter():
+    _GLOBAL_TOKEN_COUNTER.update({"calls": 0, "input": 0, "output": 0})
+
+
+def get_global_token_counter() -> dict:
+    return dict(_GLOBAL_TOKEN_COUNTER)
+
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
 DEFAULT_MAX_RETRIES = 1
@@ -129,7 +140,15 @@ class AnthropicClient:
         }
 
         data = self._request_with_retry("POST", "/v1/messages", headers, body)
-        return self._response_to_openai(data)
+        result = self._response_to_openai(data)
+
+        # Update global counter
+        usage = data.get("usage", {})
+        _GLOBAL_TOKEN_COUNTER["calls"] += 1
+        _GLOBAL_TOKEN_COUNTER["input"] += usage.get("input_tokens", 0)
+        _GLOBAL_TOKEN_COUNTER["output"] += usage.get("output_tokens", 0)
+
+        return result
 
     async def chat(self, messages: list[dict], **kwargs: Any) -> dict[str, Any]:
         return self.chat_sync(messages, **kwargs)
@@ -150,7 +169,8 @@ class AnthropicClient:
                 if resp.status_code in _RETRYABLE_STATUSES:
                     raise httpx.HTTPStatusError(
                         f"Retryable HTTP {resp.status_code}",
-                        request=resp.request, response=resp,
+                        request=resp.request,
+                        response=resp,
                     )
                 self._raise_api_error(resp)
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
@@ -177,7 +197,8 @@ class AnthropicClient:
         msg = body.get("error", {}).get("message", response.text)
         raise httpx.HTTPStatusError(
             f"API fatal error {response.status_code}: {msg}",
-            request=response.request, response=response,
+            request=response.request,
+            response=response,
         )
 
     # ------------------------------------------------------------------
@@ -199,10 +220,12 @@ class AnthropicClient:
 
         def _flush_tool_results():
             if pending_tool_results:
-                user_msgs.append({
-                    "role": "user",
-                    "content": pending_tool_results.copy(),
-                })
+                user_msgs.append(
+                    {
+                        "role": "user",
+                        "content": pending_tool_results.copy(),
+                    }
+                )
                 pending_tool_results.clear()
 
         for msg in messages:
@@ -214,11 +237,13 @@ class AnthropicClient:
                 # Accumulate consecutive tool results — they will be flushed
                 # together into one user message after the last tool message.
                 tool_call_id = msg.get("tool_call_id", "")
-                pending_tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_call_id,
-                    "content": str(content),
-                })
+                pending_tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": str(content),
+                    }
+                )
             elif role == "function":
                 _flush_tool_results()
                 name = msg.get("name", "")
@@ -237,12 +262,14 @@ class AnthropicClient:
                             args = json.loads(args)
                         except (json.JSONDecodeError, TypeError):
                             args = {}
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.get("id", f"toolu_{len(content_blocks):04d}"),
-                        "name": fn.get("name", ""),
-                        "input": args if isinstance(args, dict) else {},
-                    })
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.get("id", f"toolu_{len(content_blocks):04d}"),
+                            "name": fn.get("name", ""),
+                            "input": args if isinstance(args, dict) else {},
+                        }
+                    )
                 user_msgs.append({"role": "assistant", "content": content_blocks})
             else:
                 _flush_tool_results()
@@ -256,13 +283,13 @@ class AnthropicClient:
         result = []
         for tool in tools:
             fn = tool.get("function", tool)
-            result.append({
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters", {
-                    "type": "object", "properties": {}, "required": []
-                }),
-            })
+            result.append(
+                {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}, "required": []}),
+                }
+            )
         return result
 
     @staticmethod
@@ -295,14 +322,16 @@ class AnthropicClient:
             elif bt == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif bt == "tool_use":
-                tool_calls.append({
-                    "id": block.get("id", f"toolu_{len(tool_calls):04d}"),
-                    "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.get("id", f"toolu_{len(tool_calls):04d}"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                        },
+                    }
+                )
 
         stop_reason = data.get("stop_reason", "end_turn")
         finish_map = {"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"}
@@ -318,11 +347,13 @@ class AnthropicClient:
 
         return {
             "id": data.get("id", ""),
-            "choices": [{
-                "index": 0,
-                "finish_reason": openai_finish,
-                "message": message,
-            }],
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": openai_finish,
+                    "message": message,
+                }
+            ],
             "usage": {
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),

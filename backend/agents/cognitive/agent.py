@@ -20,7 +20,7 @@ This module ONLY handles:
 from __future__ import annotations
 
 import json
-import re
+import os as _os
 from typing import Any
 from typing import Dict
 from typing import List
@@ -226,12 +226,16 @@ class CognitiveAgent:
 
     # ---- Vote ----
 
+    @staticmethod
+    def _skip_optimisations_enabled() -> bool:
+        return _os.getenv("_DISABLE_SKIP_OPTIMISATIONS") != "1"
+
     def vote(self) -> Decision:
         obs = self._observe()
         legal_target_ids = {player.id for player in obs.legal_targets}
 
         # ── Optimisation: skip LLM when there is only one legal target ──
-        if len(legal_target_ids) == 1:
+        if self._skip_optimisations_enabled() and len(legal_target_ids) == 1:
             only_target_id = next(iter(legal_target_ids))
             only_target = obs.legal_targets[0]
             reasoning = f"唯一合法目标 {only_target.seat}号:{only_target.name}，无需LLM决策"
@@ -243,18 +247,19 @@ class CognitiveAgent:
             return self._decision(ActionType.VOTE, target_id=only_target_id, reasoning=reasoning)
 
         # ── Optimisation: reuse tentative_vote from speech if nothing changed ──
-        tentative = self._pipeline.get_tentative_vote()
-        if tentative and tentative.get("raw"):
-            tentative_target = self._resolve_target(tentative["raw"])
-            if tentative_target and tentative_target in legal_target_ids:
-                if not self._has_meaningful_new_info_since_speech(obs):
-                    reasoning = f"发言立场未变: 投{tentative_target}（" + tentative["raw"] + "）"
-                    self.memory.add_action("vote", tentative_target, f"投{tentative_target}", reasoning)
-                    self._detect_speech_vote_mismatch()
-                    active = self.memory.planner.get_active(self.memory.day, self.memory.phase)
-                    if active and "VOTE" in active.target_phase:
-                        self.memory.planner.mark_executed(self.memory.day, self.memory.phase)
-                    return self._decision(ActionType.VOTE, target_id=tentative_target, reasoning=reasoning)
+        if self._skip_optimisations_enabled():
+            tentative = self._pipeline.get_tentative_vote()
+            if tentative and tentative.get("raw"):
+                tentative_target = self._resolve_target(tentative["raw"])
+                if tentative_target and tentative_target in legal_target_ids:
+                    if not self._has_meaningful_new_info_since_speech(obs):
+                        reasoning = f"发言立场未变: 投{tentative_target}（" + tentative["raw"] + "）"
+                        self.memory.add_action("vote", tentative_target, f"投{tentative_target}", reasoning)
+                        self._detect_speech_vote_mismatch()
+                        active = self.memory.planner.get_active(self.memory.day, self.memory.phase)
+                        if active and "VOTE" in active.target_phase:
+                            self.memory.planner.mark_executed(self.memory.day, self.memory.phase)
+                        return self._decision(ActionType.VOTE, target_id=tentative_target, reasoning=reasoning)
 
         result = self._pipeline.run_vote(
             obs,
@@ -308,12 +313,10 @@ class CognitiveAgent:
         legal_target_ids = {player.id for player in obs.legal_targets}
 
         # ── Optimisation: skip LLM when there is only one legal target ──
-        if len(legal_target_ids) == 1:
+        if self._skip_optimisations_enabled() and len(legal_target_ids) == 1:
             only_target = obs.legal_targets[0]
             reasoning = f"唯一合法击杀目标 {only_target.seat}号:{only_target.name}，无需LLM决策"
-            return self._night_decision(
-                {"target": only_target.id, "reasoning": reasoning}, ActionType.ATTACK
-            )
+            return self._night_decision({"target": only_target.id, "reasoning": reasoning}, ActionType.ATTACK)
 
         extra = self._build_wolf_extra()
         result = self._pipeline.run_night(obs, self.memory, extra)
@@ -330,12 +333,10 @@ class CognitiveAgent:
         legal_target_ids = {player.id for player in obs.legal_targets}
 
         # ── Optimisation: skip LLM when there is only one legal target ──
-        if len(legal_target_ids) == 1:
+        if self._skip_optimisations_enabled() and len(legal_target_ids) == 1:
             only_target = obs.legal_targets[0]
             reasoning = f"唯一合法查验目标 {only_target.seat}号:{only_target.name}，无需LLM决策"
-            return self._night_decision(
-                {"target": only_target.id, "reasoning": reasoning}, ActionType.DIVINE
-            )
+            return self._night_decision({"target": only_target.id, "reasoning": reasoning}, ActionType.DIVINE)
 
         result = self._pipeline.run_night(obs, self.memory)
         return self._night_decision(result, ActionType.DIVINE)
@@ -355,9 +356,7 @@ class CognitiveAgent:
             reasoning = f"唯一合法守护目标 {only_target.seat}号:{only_target.name}，无需LLM决策"
             self._guard_history.append(only_target.id)
             self.memory.role_state.setdefault("protections", []).append(f"D{self.memory.day}: {only_target.id}")
-            return self._night_decision(
-                {"target": only_target.id, "reasoning": reasoning}, ActionType.GUARD
-            )
+            return self._night_decision({"target": only_target.id, "reasoning": reasoning}, ActionType.GUARD)
 
         result = self._pipeline.run_night(obs, self.memory, extra)
         if result["target"]:
@@ -367,7 +366,7 @@ class CognitiveAgent:
 
     def witch_act(self, victim_id: Optional[str]) -> List[Decision]:
         # ── Optimisation: skip LLM when no potions available ──
-        if self._witch_save_used and self._witch_poison_used:
+        if self._skip_optimisations_enabled() and self._witch_save_used and self._witch_poison_used:
             return [self._decision(ActionType.SKIP, reasoning="双药已用，无需LLM决策")]
 
         lines = []
@@ -464,9 +463,22 @@ class CognitiveAgent:
         target_id = self._resolve_target(parsed["target"])
         if not target_id:
             parsed_target = str(parsed.get("target", "")).strip().lower()
-            is_explicit_no_action = parsed_target in ("none", "null", "无", "空", "弃票", "弃权", "abstain", "pass", "跳过", "不行动")
+            is_explicit_no_action = parsed_target in (
+                "none",
+                "null",
+                "无",
+                "空",
+                "弃票",
+                "弃权",
+                "abstain",
+                "pass",
+                "跳过",
+                "不行动",
+            )
             if self._strict_no_fallback:
-                detail = "explicit no-action is not legal for hunter shoot" if is_explicit_no_action else "unresolved target"
+                detail = (
+                    "explicit no-action is not legal for hunter shoot" if is_explicit_no_action else "unresolved target"
+                )
                 raise RuntimeError(f"LLM returned invalid shoot target ({detail}): {parsed['target']!r}")
             target_id = None
         return self._decision(ActionType.SHOOT, target_id=target_id, reasoning=parsed["reasoning"])
@@ -663,9 +675,7 @@ class CognitiveAgent:
 
         Used by Plan A optimisation (speech→vote skip).
         """
-        my_speeches = [
-            s for s in obs.speeches if s.player_id == self.player_id
-        ]
+        my_speeches = [s for s in obs.speeches if s.player_id == self.player_id]
         if not my_speeches:
             # Agent hasn't spoken yet this day → must call LLM
             return True
@@ -673,17 +683,25 @@ class CognitiveAgent:
 
         # Check for speeches AFTER this agent's last speech
         later_speeches = [
-            s for s in obs.speeches
-            if s.player_id != self.player_id
-            and obs.speeches.index(s) > obs.speeches.index(my_last_speech)
+            s
+            for s in obs.speeches
+            if s.player_id != self.player_id and obs.speeches.index(s) > obs.speeches.index(my_last_speech)
         ]
 
         for speech in later_speeches:
             content = speech.content.lower()
             # Someone claimed a power role (预言家/女巫/守卫/猎人/白痴)
             for role_claim_kw in [
-                "我是预言家", "我是女巫", "我是守卫", "我是猎人", "我是白痴",
-                "我跳预言家", "我起跳", "查了", "查验", "查杀",
+                "我是预言家",
+                "我是女巫",
+                "我是守卫",
+                "我是猎人",
+                "我是白痴",
+                "我跳预言家",
+                "我起跳",
+                "查了",
+                "查验",
+                "查杀",
             ]:
                 if role_claim_kw in content:
                     return True
@@ -700,10 +718,7 @@ class CognitiveAgent:
 
         # Check for new role claims from belief tracker
         for claim in getattr(obs, "role_claims", []) or []:
-            if (
-                claim.player_name != self.player_name
-                and "预言家" in str(getattr(claim, "claimed_role", "") or "")
-            ):
+            if claim.player_name != self.player_name and "预言家" in str(getattr(claim, "claimed_role", "") or ""):
                 return True
 
         return False
