@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from backend.engine.models import Alignment
 from backend.engine.models import ActionType
 from backend.engine.models import Decision
 from backend.engine.models import GameState
@@ -57,4 +58,8 @@ class ActionValidator:
                 ActionType.SHOOT,
             }:
                 return False
+            # 狼人不能攻击狼队友（CLAUDE.md 关键规则 #1）
+            if decision.action_type == ActionType.ATTACK:
+                if target.alignment == Alignment.WOLF:
+                    return False
         return True

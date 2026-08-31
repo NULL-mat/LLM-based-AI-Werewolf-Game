@@ -341,12 +341,14 @@ class AgentLoop:
                 self._inject_tool_trace(decision, tool_trace, obs)
                 return decision
 
-        # Last-resort: try to use the last response as the decision content
+        # Last-resort: use the most recent assistant response as the decision.
+        # LLM responses may be stored as HumanMessage during format-correction
+        # feedback, so we check for any non-system message with content.
         last_text = ""
         for msg in reversed(context):
             if hasattr(msg, "content") and msg.content:
                 c = msg.content.strip()
-                if len(c) > 10 and hasattr(msg, "type") and msg.type == "ai":
+                if len(c) > 10 and getattr(msg, "type", "") != "system":
                     last_text = c
                     break
         if last_text:
@@ -361,10 +363,13 @@ class AgentLoop:
                     return {"target": data.get("target", ""), "reasoning": data.get("reasoning", "")}
                 except json.JSONDecodeError:
                     pass
-            # Use raw text as speech content
+            # Use raw text as decision content
             if self._action_type == "speech":
                 logger.warning("Using raw response as speech (no DECISION format found)")
                 return {"speech": last_text[:500], "reasoning": "fallback from raw response"}
+            # For vote/night: try to extract a player name as target
+            logger.warning(f"Using raw response for {self._action_type} (no DECISION format found)")
+            return {"target": "", "reasoning": f"fallback: {last_text[:100]}"}
 
         raise RuntimeError(
             f"AgentLoop failed to produce a DECISION after {MAX_ITERATIONS} iterations for action={self._action_type}"
@@ -648,37 +653,22 @@ class AgentLoop:
 
         When tool_schemas is provided and the LLM supports bind_tools,
         uses native function calling. Otherwise falls back to plain invoke.
-        """
-        import time as _time
 
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                if tool_schemas and self._supports_bind_tools:
-                    llm = self._llm.bind_tools(tool_schemas)
-                else:
-                    llm = self._llm
-                if self._temperature is not None:
-                    resp = llm.invoke(messages, temperature=self._temperature)
-                else:
-                    resp = llm.invoke(messages)
-                # Accept if has tool_calls or reasonable content
-                has_tools = hasattr(resp, "tool_calls") and resp.tool_calls
-                has_content = resp.content and len(resp.content.strip()) > 5
-                if has_tools or has_content:
-                    # Accumulate token usage from response_metadata
-                    self._accumulate_usage(resp)
-                    return resp
-                # Empty response — wait and retry
-                logger.warning(f"LLM returned empty/short response (attempt {attempt + 1}), retrying...")
-                _time.sleep(1)
-            except Exception as e:
-                last_error = e
-                logger.warning(f"LLM call failed (attempt {attempt + 1}): {e}")
-                _time.sleep(1)
-        if last_error is not None:
-            raise RuntimeError("LLM call failed after 3 attempts") from last_error
-        raise RuntimeError("LLM returned empty response after 3 attempts")
+        No retry loop here — DeepSeekClient handles retries with exponential
+        backoff internally. We just make one call and return the result.
+        """
+        if tool_schemas and self._supports_bind_tools:
+            llm = self._llm.bind_tools(tool_schemas)
+        else:
+            llm = self._llm
+        if self._temperature is not None:
+            resp = llm.invoke(messages, temperature=self._temperature)
+        else:
+            resp = llm.invoke(messages)
+
+        # Accumulate token usage from response_metadata
+        self._accumulate_usage(resp)
+        return resp
 
     def _accumulate_usage(self, resp: Any) -> None:
         """Accumulate token usage from AIMessage.response_metadata across loop iterations."""
@@ -840,6 +830,60 @@ class AgentLoop:
         # Find DECISION: marker
         marker_match = re.search(r"DECISION:\s*", response, re.IGNORECASE)
         if not marker_match:
+            # Fallback: LLM often outputs JSON directly without DECISION: prefix.
+            # Try to find any top-level JSON object that looks like a decision.
+            json_match = re.search(r'\{\s*"(?:speech|target|reasoning)"\s*:', response)
+            if json_match:
+                marker_match = json_match
+                # Pretend marker was at position 0 so the JSON parsing works
+                # — we just need the JSON starting from the first brace.
+                brace_start = response.rfind("{", 0, json_match.start() + 1)
+                if brace_start < 0:
+                    brace_start = json_match.start()
+                # We'll set start manually below instead of using marker_match
+                start = brace_start
+                # Skip DECISION prefix logic, go straight to JSON extraction
+                # Check for balanced braces
+                depth = 0
+                in_string = False
+                escape = False
+                end = start
+                for i in range(start, len(response)):
+                    ch = response[i]
+                    if escape:
+                        escape = False
+                        continue
+                    if ch == "\\":
+                        escape = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                json_str = response[start:end] if depth == 0 else response[start:]
+                try:
+                    data = json.loads(json_str)
+                    if isinstance(data, dict) and (data.get("speech") or data.get("target")):
+                        result: Dict[str, str] = {}
+                        if self._action_type == "speech":
+                            result["speech"] = data.get("speech", data.get("content", ""))
+                            result["reasoning"] = data.get("reasoning", "")
+                        else:
+                            result["target"] = data.get("target", "")
+                            result["reasoning"] = data.get("reasoning", "")
+                        if any(v for v in result.values()):
+                            logger.info(f"No DECISION: marker, but found JSON directly: {list(result.keys())}")
+                            return result
+                except json.JSONDecodeError:
+                    pass
             return None
 
         start = marker_match.end()

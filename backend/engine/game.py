@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 from collections import Counter
 from random import Random
 from typing import Any
@@ -138,6 +139,13 @@ class WerewolfGame:
         self.human_action_buffer: dict[str, list[Decision]] = {}
         self.interrupt_phase_cycle = False
         self.phase_delay_ms = phase_delay_ms
+
+        # Task 2: Deferred DB write — buffer all decisions in memory, flush at game end.
+        self._pending_decisions: list[dict] = []
+        self._decisions_flushed: bool = False
+
+        # Task 3: Streaming token buffer for WebSocket real-time output
+        self._stream_token_buffer: queue.Queue = queue.Queue()
         # `_play_started` flips True the moment someone calls play() so a
         # reconnecting WebSocket can tell "this game is already running, just
         # tail it" apart from "this game was prepared but never started — I
@@ -149,6 +157,8 @@ class WerewolfGame:
         self.play_done: _threading.Event = _threading.Event()
         self._play_start_lock: _threading.Lock = _threading.Lock()
         self._shared_lock: _threading.RLock = _threading.RLock()
+        # Agent 独占锁：保护并发 _batch_ask 时的 agent.update() 和决策调用
+        self._agent_locks: dict[str, _threading.RLock] = {}
         sampled_personas = sampled_personas or self._sample_personas_from_db(len(self.state.players), seed)
         if not sampled_personas:
             # DB unavailable — shuffle in-memory PERSONA_POOL per seed so
@@ -200,7 +210,14 @@ class WerewolfGame:
             return None
 
     def attach_agents(self, agents: dict[str, Agent]) -> None:
+        import threading as _threading
+
         self.agents = agents
+        # 为每个 agent 创建独占锁
+        for player_id in agents.keys():
+            if player_id not in self._agent_locks:
+                self._agent_locks[player_id] = _threading.RLock()
+
         for player in self.state.players:
             char = self.characters.get(player.id)
             if char is not None and hasattr(self.agents[player.id], "character"):
@@ -339,6 +356,13 @@ class WerewolfGame:
                         "Human input required; use play_until_blocked/submit_human_action for mixed games."
                     )
             return self.state
+        except Exception:
+            # Task 2: Crash-safe — flush pending decisions even on game crash
+            try:
+                self.flush_decisions_to_db()
+            except Exception:
+                pass
+            raise
         finally:
             self.play_done.set()
 
@@ -396,6 +420,8 @@ class WerewolfGame:
             self._set_phase(Phase.GAME_END)
             for agent in self.agents.values():
                 agent.finish(self.state.winner.value if self.state.winner else None)
+            # Task 2: Flush buffered decisions to DB before final save_game_end
+            self.flush_decisions_to_db()
             try:
                 from backend.db.persist import save_game_end
 
@@ -509,17 +535,15 @@ class WerewolfGame:
             [self.state.player(candidate_id) for candidate_id in self.state.badge.candidates]
         )
 
-        def handle(player: Player) -> None:
-            if not player.alive:
-                return
-            decision = self._ask(player, "BADGE_SPEECH", lambda agent: agent.talk())
-            if not self.validator.validate(self.state, decision):
-                return
-            self._emit_speech(player, decision, {"badge_campaign": True})
-            if self._maybe_white_wolf_king_boom(player):
-                return
-
-        self._run_actor_sequence(Phase.DAY_BADGE_SPEECH, candidates, handle)
+        # Parallel badge campaign speeches
+        decisions = self._batch_ask(candidates, "BADGE_SPEECH", lambda agent: agent.talk())
+        for player, decision in zip(candidates, decisions):
+            if not isinstance(decision, Decision):
+                continue
+            if player.alive and self.validator.validate(self.state, decision):
+                self._emit_speech(player, decision, {"badge_campaign": True})
+                if self._maybe_white_wolf_king_boom(player):
+                    return
         self._mark_phase_done(Phase.DAY_BADGE_SPEECH)
 
     def _badge_election_phase(self) -> None:
@@ -601,81 +625,81 @@ class WerewolfGame:
         self._mark_phase_done(Phase.DAY_BADGE_ELECTION)
 
     def _night_role_actions_parallel(self) -> None:
-        """Run Guard + Wolf + Seer with parallelism where safe.
+        """Run Guard + Wolf + Seer night actions with maximum parallelism.
 
-        Guard and Seer are independent of each other and of wolves (they
-        read public state only, write to different NightActions fields).
-        Wolf internal voting is sequential (later wolves see earlier votes)
-        so it stays in the main thread. Witch depends on wolf_target_id
-        and runs separately after this method completes.
+        Guard and Seer are independent (read public state, write different
+        NightActions fields). Wolf internal voting is sequential (each wolf
+        sees earlier teammates' votes) so it stays synchronous, but its
+        first LLM call overlaps with Guard/Seer via ThreadPoolExecutor.
 
-        Thread safety: _guard_phase / _wolf_phase / _seer_phase all use
-        _set_phase → _log → events.append and _record_decision →
-        decision_records.append, both now protected by _shared_lock.
+        Witch depends on wolf_target_id and runs after this method completes.
         """
-        import sys as _sys
-        import threading as _thr
+        import concurrent.futures as _futures
+        from concurrent.futures import ThreadPoolExecutor as _TPE
 
         guard = self._alive_role(Role.GUARD)
         seer = self._alive_role(Role.SEER)
 
-        guard_done = _thr.Event()
-        seer_done = _thr.Event()
-        guard_err: list[BaseException | None] = [None]
-        seer_err: list[BaseException | None] = [None]
+        tasks: list[tuple[str, Any]] = []
+        if guard and not self._phase_done(Phase.NIGHT_GUARD_ACTION):
+            self._clear_phase_done(Phase.NIGHT_GUARD_ACTION)
+            tasks.append(("guard", self._guard_phase))
+        if seer and not self._phase_done(Phase.NIGHT_SEER_ACTION):
+            self._clear_phase_done(Phase.NIGHT_SEER_ACTION)
+            tasks.append(("seer", self._seer_phase))
 
-        def _run_guard():
-            try:
-                if guard and not self._phase_done(Phase.NIGHT_GUARD_ACTION):
-                    self._clear_phase_done(Phase.NIGHT_GUARD_ACTION)
-                    self._guard_phase()
-            except GamePaused:
-                guard_err[0] = _sys.exc_info()[1]
-            except BaseException as e:
-                guard_err[0] = e
-            finally:
-                guard_done.set()
+        has_wolf = not self._phase_done(Phase.NIGHT_WOLF_ACTION)
 
-        def _run_seer():
-            try:
-                if seer and not self._phase_done(Phase.NIGHT_SEER_ACTION):
-                    self._clear_phase_done(Phase.NIGHT_SEER_ACTION)
-                    self._seer_phase()
-            except GamePaused:
-                seer_err[0] = _sys.exc_info()[1]
-            except BaseException as e:
-                seer_err[0] = e
-            finally:
-                seer_done.set()
+        if not tasks and not has_wolf:
+            return
 
-        g_thread = _thr.Thread(target=_run_guard, name="guard") if guard else None
-        s_thread = _thr.Thread(target=_run_seer, name="seer") if seer else None
+        errors: dict[str, BaseException] = {}
 
-        if g_thread:
-            g_thread.start()
-        if s_thread:
-            s_thread.start()
+        # Launch Guard + Seer in thread pool; Wolf runs in main thread
+        # so its sequential internal voting is naturally handled.  The
+        # first wolf LLM call overlaps with Guard/Seer HTTP round-trips.
+        if tasks:
+            with _TPE(max_workers=len(tasks)) as pool:
+                fut_to_name: dict[_futures.Future, str] = {}
+                for name, fn in tasks:
+                    fut = pool.submit(fn)
+                    fut_to_name[fut] = name
 
-        # Run Wolf in main thread while Guard/Seer progress in background
-        if not self._phase_done(Phase.NIGHT_WOLF_ACTION):
+                if has_wolf:
+                    try:
+                        self._wolf_phase()
+                    except GamePaused:
+                        # Let background tasks finish so we don't leave
+                        # dangling threads mutating game state.
+                        for fut in _futures.as_completed(fut_to_name):
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
+                        raise
+
+                # Collect Guard / Seer results
+                for fut in _futures.as_completed(fut_to_name):
+                    name = fut_to_name[fut]
+                    try:
+                        fut.result()
+                    except GamePaused as e:
+                        errors[name] = e
+                    except BaseException as e:
+                        logger.error(f"Night action {name} failed: {e}", exc_info=True)
+                        errors[name] = e
+        elif has_wolf:
+            # Only wolf phase — no thread pool needed
             self._wolf_phase()
 
-        # Wait for Guard and Seer to finish
-        if g_thread:
-            g_thread.join()
-        if s_thread:
-            s_thread.join()
-
-        # Propagate GamePaused from background threads
-        if isinstance(guard_err[0], GamePaused):
-            raise guard_err[0]
-        if isinstance(seer_err[0], GamePaused):
-            raise seer_err[0]
-        # Propagate other errors
-        if guard_err[0]:
-            raise guard_err[0]
-        if seer_err[0]:
-            raise seer_err[0]
+        # Propagate GamePaused after all threads have joined
+        for _name, err in errors.items():
+            if isinstance(err, GamePaused):
+                raise err
+        # Surface first non-pause error
+        for _name, err in errors.items():
+            if not isinstance(err, GamePaused):
+                raise err
 
     def _guard_phase(self) -> None:
         if self._phase_done(Phase.NIGHT_GUARD_ACTION):
@@ -691,26 +715,13 @@ class WerewolfGame:
             return
         if decision.target_id == self.state.night_actions.last_guard_target_id:
             self._log_decision(decision, "private", {"ignored": True, "reason": "guard_cannot_repeat"}, [guard.id])
-            with self._shared_lock:
-                saved = self.state.phase
-                self.state.phase = Phase.NIGHT_GUARD_ACTION
-                self._log(EventType.NIGHT_ACTION, "public", {
-                    "action_type": "skip", "actor_name": guard.name, "reason": "guard_cannot_repeat",
-                })
-                self.state.phase = saved
             self._mark_phase_done(Phase.NIGHT_GUARD_ACTION)
             return
-        self.state.night_actions.guard_target_id = decision.target_id
-        self.state.night_actions.last_guard_target_id = decision.target_id
-        self._log_decision(decision, "private", {"target_id": decision.target_id}, [guard.id])
-        target = self.state.player(decision.target_id)
+        # 并发保护：Guard/Wolf/Seer 可能在后台线程运行，锁保护 night_actions 写入
         with self._shared_lock:
-            saved = self.state.phase
-            self.state.phase = Phase.NIGHT_GUARD_ACTION
-            self._log(EventType.NIGHT_ACTION, "public", {
-                "action_type": "guard", "actor_name": guard.name, "target": target.public_dict(),
-            })
-            self.state.phase = saved
+            self.state.night_actions.guard_target_id = decision.target_id
+            self.state.night_actions.last_guard_target_id = decision.target_id
+        self._log_decision(decision, "public", {"target_id": decision.target_id})
         self._mark_phase_done(Phase.NIGHT_GUARD_ACTION)
 
     def _wolf_phase(self) -> None:
@@ -761,7 +772,9 @@ class WerewolfGame:
             )
             decision = self._ask(wolf, "WOLF_TEAM_VOTE", lambda agent: agent.attack())
             if self.validator.validate(self.state, decision):
-                self.state.night_actions.wolf_votes[wolf.id] = decision.target_id or ""
+                # 并发保护：Wolf 投票写入需要锁
+                with self._shared_lock:
+                    self.state.night_actions.wolf_votes[wolf.id] = decision.target_id or ""
                 self._log_decision(
                     decision,
                     "private",
@@ -776,7 +789,8 @@ class WerewolfGame:
 
         self._run_actor_sequence(Phase.NIGHT_WOLF_ACTION, self._seat_sorted(wolves), handle)
         if self.state.night_actions.wolf_votes:
-            self.state.night_actions.wolf_target_id = self._majority_target(self.state.night_actions.wolf_votes)
+            with self._shared_lock:
+                self.state.night_actions.wolf_target_id = self._majority_target(self.state.night_actions.wolf_votes)
             final_target = self.state.player(self.state.night_actions.wolf_target_id)
             self._log(
                 EventType.PRIVATE_INFO,
@@ -813,13 +827,10 @@ class WerewolfGame:
                     )
                     continue
                 if self.validator.validate(self.state, decision):
-                    self.state.abilities.witch_heal_used = True
-                    self.state.night_actions.witch_save = True
-                    self._log_decision(decision, "private", {"target_id": decision.target_id}, [witch.id])
-                    victim = self.state.player(victim_id)
-                    self._log(EventType.NIGHT_ACTION, "public", {
-                        "action_type": "witch_save", "actor_name": witch.name, "target": victim.public_dict(),
-                    })
+                    with self._shared_lock:
+                        self.state.abilities.witch_heal_used = True
+                        self.state.night_actions.witch_save = True
+                    self._log_decision(decision, "public", {"target_id": decision.target_id})
                 else:
                     logger.warning(f"Witch {witch.name} save rejected: validator failed")
             elif decision.action_type == ActionType.WITCH_POISON:
@@ -827,20 +838,14 @@ class WerewolfGame:
                     logger.warning(f"Witch {witch.name} poison rejected: poison already used")
                     continue
                 if self.validator.validate(self.state, decision):
-                    self.state.abilities.witch_poison_used = True
-                    self.state.night_actions.witch_poison_target_id = decision.target_id
-                    self._log_decision(decision, "private", {"target_id": decision.target_id}, [witch.id])
-                    poison_target = self.state.player(decision.target_id)
-                    self._log(EventType.NIGHT_ACTION, "public", {
-                        "action_type": "witch_poison", "actor_name": witch.name, "target": poison_target.public_dict(),
-                    })
+                    with self._shared_lock:
+                        self.state.abilities.witch_poison_used = True
+                        self.state.night_actions.witch_poison_target_id = decision.target_id
+                    self._log_decision(decision, "public", {"target_id": decision.target_id})
                 else:
                     logger.warning(f"Witch {witch.name} poison rejected: validator failed")
             elif decision.action_type == ActionType.SKIP:
-                self._log_decision(decision, "private", {"skipped": True}, [witch.id])
-                self._log(EventType.NIGHT_ACTION, "public", {
-                    "action_type": "skip", "actor_name": witch.name, "target": None,
-                })
+                self._log_decision(decision, "public", {"skipped": True})
         self._mark_phase_done(Phase.NIGHT_WITCH_ACTION)
 
     def _seer_phase(self) -> None:
@@ -863,18 +868,11 @@ class WerewolfGame:
             "is_wolf": target.alignment == Alignment.WOLF,
             "message": f"Seer check: {target.name} is {'wolf' if target.alignment == Alignment.WOLF else 'not wolf'}.",
         }
-        self.state.night_actions.seer_target_id = target.id
-        self.state.night_actions.seer_result = result
-        self._log_decision(decision, "private", {"target_id": target.id}, [seer.id])
-        self._log(EventType.PRIVATE_INFO, "private", result, visible_to=[seer.id])
         with self._shared_lock:
-            saved = self.state.phase
-            self.state.phase = Phase.NIGHT_SEER_ACTION
-            self._log(EventType.NIGHT_ACTION, "public", {
-                "action_type": "divine", "actor_name": seer.name, "target": target.public_dict(),
-                "is_wolf": target.alignment == Alignment.WOLF,
-            })
-            self.state.phase = saved
+            self.state.night_actions.seer_target_id = target.id
+            self.state.night_actions.seer_result = result
+        self._log_decision(decision, "public", {"target_id": target.id}, [seer.id])
+        self._log(EventType.PRIVATE_INFO, "private", result, visible_to=[seer.id])
         self._mark_phase_done(Phase.NIGHT_SEER_ACTION)
 
     def _night_resolve(self) -> None:
@@ -883,12 +881,25 @@ class WerewolfGame:
         self._set_phase(Phase.NIGHT_RESOLVE)
         deaths: list[dict[str, str]] = []
         wolf_target_id = self.state.night_actions.wolf_target_id
-        if (
+        guard_target_id = self.state.night_actions.guard_target_id
+        witch_save = self.state.night_actions.witch_save
+
+        # 奶穿判定：同时被守卫守护和女巫解药救 → 死亡（CLAUDE.md 核心规则）
+        both_guarded_and_saved = (
             wolf_target_id
-            and not self.state.night_actions.witch_save
-            and wolf_target_id != self.state.night_actions.guard_target_id
-        ):
-            deaths.append({"player_id": wolf_target_id, "reason": "wolf"})
+            and witch_save
+            and wolf_target_id == guard_target_id
+        )
+
+        if wolf_target_id:
+            if both_guarded_and_saved:
+                # 同守同救（奶穿）→ 死
+                deaths.append({"player_id": wolf_target_id, "reason": "milk_through"})
+            elif not witch_save and wolf_target_id != guard_target_id:
+                # 既没被守也没被救 → 死
+                deaths.append({"player_id": wolf_target_id, "reason": "wolf"})
+            # else: 只被守或只被救（但不同时）→ 活
+
         poison_target_id = self.state.night_actions.witch_poison_target_id
         if poison_target_id:
             deaths.append({"player_id": poison_target_id, "reason": "poison"})
@@ -927,16 +938,21 @@ class WerewolfGame:
             return
         self._set_phase(Phase.DAY_SPEECH)
 
-        def handle(player: Player) -> None:
-            decision = self._ask(player, "TALK", lambda agent: agent.talk())
+        speakers = self._day_speech_order()
+        # Parallel execution — all players speak simultaneously.
+        # Each agent forms opinions independently from public info (not from
+        # other speeches in the same round), so parallelism is correct.
+        decisions = self._batch_ask(
+            speakers, "TALK", lambda agent: agent.talk()
+        )
+        for player, decision in zip(speakers, decisions):
+            if not isinstance(decision, Decision):
+                continue
             if not self.validator.validate(self.state, decision):
-                return
+                continue
             self._emit_speech(player, decision, {})
             if self._maybe_white_wolf_king_boom(player):
                 return
-
-        speakers = self._day_speech_order()
-        self._run_actor_sequence(Phase.DAY_SPEECH, speakers, handle)
         self._mark_phase_done(Phase.DAY_SPEECH)
 
     def _sheriff_closing_phase(self) -> None:
@@ -968,15 +984,16 @@ class WerewolfGame:
         names = ", ".join(player.name for player in pk_players)
         self._log(EventType.SYSTEM_MESSAGE, "public", {"message": f"Vote tie. PK speeches between {names}."})
 
-        def handle(player: Player) -> None:
-            decision = self._ask(player, "TALK", lambda agent: agent.talk())
-            if not self.validator.validate(self.state, decision):
-                return
-            self._emit_speech(player, decision, {"pk_speech": True})
-            if self._maybe_white_wolf_king_boom(player):
-                return
-
-        self._run_actor_sequence(Phase.DAY_PK_SPEECH, self._seat_sorted(pk_players), handle)
+        # Parallel PK speeches
+        pk_sorted = self._seat_sorted(pk_players)
+        decisions = self._batch_ask(pk_sorted, "TALK", lambda agent: agent.talk())
+        for player, decision in zip(pk_sorted, decisions):
+            if not isinstance(decision, Decision):
+                continue
+            if self.validator.validate(self.state, decision):
+                self._emit_speech(player, decision, {"pk_speech": True})
+                if self._maybe_white_wolf_king_boom(player):
+                    return
 
     def _vote_phase(self) -> None:
         if self._phase_done(Phase.DAY_VOTE):
@@ -1087,10 +1104,11 @@ class WerewolfGame:
             self._refresh_day_summary()
             self._mark_phase_done(Phase.DAY_RESOLVE)
             return
-        self._last_words_phase(target_id)
-        self._kill(target_id, "vote")
+        # 先公布投票结果，再遗言（CLAUDE.md 规则 #4）
         target = self.state.player(target_id)
         self._log(EventType.SYSTEM_MESSAGE, "public", {"message": f"{target.name} was voted out."})
+        self._last_words_phase(target_id)
+        self._kill(target_id, "vote")
         # Check win immediately after death — skip hunter/badge on decided game
         if self._check_win():
             self._mark_phase_done(Phase.DAY_RESOLVE)
@@ -1321,52 +1339,55 @@ class WerewolfGame:
     def _ask(self, player: Player, request: str, call, *, many: bool = False):
         view = self.visibility.for_player(self.state, player.id)
         agent = self.agents[player.id]
-        agent.update(view, request)
-        if not player.is_ai:
-            queued = self.human_action_buffer.get(player.id, [])
-            if not queued:
-                self.state.pending_input = self._build_pending_input(player, request)
-                if self.observer is not None:
-                    self.observer(self.state)
-                raise GamePaused(f"Waiting for human input: {player.name} {request}")
-            result = queued if many else queued[0]
-            self.human_action_buffer[player.id] = []
+
+        # 用 agent 独占锁保护 update() 和 call()，防止并发访问同一 agent
+        with self._agent_locks.get(player.id, self._shared_lock):
+            agent.update(view, request)
+            if not player.is_ai:
+                queued = self.human_action_buffer.get(player.id, [])
+                if not queued:
+                    self.state.pending_input = self._build_pending_input(player, request)
+                    if self.observer is not None:
+                        self.observer(self.state)
+                    raise GamePaused(f"Waiting for human input: {player.name} {request}")
+                result = queued if many else queued[0]
+                self.human_action_buffer[player.id] = []
+                if isinstance(result, Decision):
+                    self._record_decision(player, request, view.__dict__, result, raw_output="[human]")
+                else:
+                    for item in result:
+                        self._record_decision(player, request, view.__dict__, item, raw_output="[human]")
+                return result
+            # AI turn — emit a "thinking" snapshot BEFORE we block on the LLM
+            # round-trip. The frontend reads `current_speaker_id` to light up the
+            # PlayerCard with a "思考中" pulse; without this frame the UI looks
+            # frozen for the 4–10s the LLM is actually working.
+            prior_speaker = self.state.current_speaker_id
+            self.state.current_speaker_id = player.id
+            if self.observer is not None:
+                self.observer(self.state)
+            try:
+                result = call(agent)
+            finally:
+                # Only clear if we set it for this _ask — phases like DAY_SPEECH
+                # already manage current_speaker_id externally and we shouldn't
+                # blow it away.
+                if self.state.current_speaker_id == player.id and prior_speaker != player.id:
+                    self.state.current_speaker_id = prior_speaker
             if isinstance(result, Decision):
-                self._record_decision(player, request, view.__dict__, result, raw_output="[human]")
-            else:
-                for item in result:
-                    self._record_decision(player, request, view.__dict__, item, raw_output="[human]")
-            return result
-        # AI turn — emit a "thinking" snapshot BEFORE we block on the LLM
-        # round-trip. The frontend reads `current_speaker_id` to light up the
-        # PlayerCard with a "思考中" pulse; without this frame the UI looks
-        # frozen for the 4–10s the LLM is actually working.
-        prior_speaker = self.state.current_speaker_id
-        self.state.current_speaker_id = player.id
-        if self.observer is not None:
-            self.observer(self.state)
-        try:
-            result = call(agent)
-        finally:
-            # Only clear if we set it for this _ask — phases like DAY_SPEECH
-            # already manage current_speaker_id externally and we shouldn't
-            # blow it away.
-            if self.state.current_speaker_id == player.id and prior_speaker != player.id:
-                self.state.current_speaker_id = prior_speaker
-        if isinstance(result, Decision):
-            raw = str(result.metadata.get("raw_text", ""))
-            reasoning = str(result.metadata.get("reasoning", ""))
-            if reasoning:
-                raw = f"[推理]\n{reasoning[:3000]}\n\n[输出]\n{raw}"
-            self._record_decision(player, request, view.__dict__, result, raw_output=raw)
-        elif isinstance(result, list):
-            for item in result:
-                raw = str(item.metadata.get("raw_text", ""))
-                reasoning = str(item.metadata.get("reasoning", ""))
+                raw = str(result.metadata.get("raw_text", ""))
+                reasoning = str(result.metadata.get("reasoning", ""))
                 if reasoning:
                     raw = f"[推理]\n{reasoning[:3000]}\n\n[输出]\n{raw}"
-                self._record_decision(player, request, view.__dict__, item, raw_output=raw)
-        return result if many else result
+                self._record_decision(player, request, view.__dict__, result, raw_output=raw)
+            elif isinstance(result, list):
+                for item in result:
+                    raw = str(item.metadata.get("raw_text", ""))
+                    reasoning = str(item.metadata.get("reasoning", ""))
+                    if reasoning:
+                        raw = f"[推理]\n{reasoning[:3000]}\n\n[输出]\n{raw}"
+                    self._record_decision(player, request, view.__dict__, item, raw_output=raw)
+            return result if many else result
 
     def _batch_ask(
         self,
@@ -1571,6 +1592,26 @@ class WerewolfGame:
             },
         )
 
+    def flush_decisions_to_db(self) -> int:
+        """Batch-insert all buffered decisions to PostgreSQL at game end.
+
+        Uses the existing persist.save_decisions_batch() for bulk insert.
+        Exception-safe: wraps in try/except so a DB failure never crashes the game.
+        Returns the number of decisions flushed.
+        """
+        if self._decisions_flushed or not self._pending_decisions:
+            return 0
+        try:
+            from backend.db.persist import save_decisions_batch
+
+            count = save_decisions_batch(self._pending_decisions)
+            self._decisions_flushed = True
+            logger.info(f"Flushed {count} decisions to DB for game {self.state.id}")
+            return count
+        except Exception:
+            logger.exception("Failed to flush decisions to DB (non-fatal)")
+            return 0
+
     def _check_win(self) -> bool:
         # Guard against duplicate calls — winner is already set
         if self.state.winner is not None:
@@ -1579,12 +1620,30 @@ class WerewolfGame:
         alive_village = [player for player in self.state.alive_players if player.alignment == Alignment.VILLAGE]
         winner: Alignment | None = None
         reason = ""
+
+        # 好人赢：所有狼死
         if not alive_wolves:
             winner = Alignment.VILLAGE
             reason = "all_wolves_dead"
+        # 狼人赢：屠城（人数平局或狼人更多）
         elif len(alive_wolves) >= len(alive_village):
             winner = Alignment.WOLF
             reason = "wolves_reached_parity"
+        # 狼人赢：屠边（所有神死 或 所有村民死）
+        else:
+            # 区分神民和平民
+            gods = [p for p in alive_village if p.role in {Role.SEER, Role.WITCH, Role.HUNTER, Role.GUARD, Role.IDIOT}]
+            villagers = [p for p in alive_village if p.role == Role.VILLAGER]
+
+            if not gods and villagers:
+                # 所有神出局，只剩村民 → 狼人屠边胜利
+                winner = Alignment.WOLF
+                reason = "all_gods_dead"
+            elif not villagers and gods:
+                # 所有村民出局，只剩神 → 狼人屠边胜利
+                winner = Alignment.WOLF
+                reason = "all_villagers_dead"
+
         if winner:
             self.state.winner = winner
             self._log(EventType.GAME_END, "public", {"winner": winner.value, "reason": reason})
@@ -1800,6 +1859,43 @@ class WerewolfGame:
                 for target in self.state.alive_players:
                     if target.id != player.id and (allowed is None or target.id in allowed):
                         candidate_actions.append({"target_id": target.id, "target_name": target.name})
+
+        # Task 2: Buffer decision for deferred batch DB write
+        decision_data = {
+            "game_id": self.state.id,
+            "player_id": player.id,
+            "player_name": player.name,
+            "day": self.state.day,
+            "phase": self.state.phase.value,
+            "request": request,
+            "observation": view,
+            "parsed_action": {
+                "action_type": decision.action_type.value,
+                "target_id": decision.target_id,
+                "speech": decision.speech,
+                "reasoning": decision.reasoning,
+                "metadata": decision.metadata,
+                "retrieved_knowledge_ids": list(decision.metadata.get("retrieved_knowledge_ids", [])),
+                "retrieval_query_summary": decision.metadata.get("retrieval_query_summary"),
+                "retrieval_used": bool(decision.metadata.get("retrieval_used", False)),
+            },
+            "raw_output": raw_output,
+            "is_valid": is_valid,
+            "error_type": error_type,
+            "latency_ms": int(latency_ms) if isinstance(latency_ms, (int, float)) else None,
+            "prompt_tokens": int(prompt_tokens) if isinstance(prompt_tokens, (int, float)) else None,
+            "completion_tokens": int(completion_tokens) if isinstance(completion_tokens, (int, float)) else None,
+            "visible_facts": visible_facts,
+            "candidate_actions": candidate_actions,
+            "confidence": meta.get("confidence"),
+            "prompt_hash": prompt_hash,
+            "cost_usd": cost_usd,
+            "model_name": meta.get("model"),
+            "provider": meta.get("provider"),
+            "fallback_used": bool(meta.get("fallback", False)),
+            "fallback_reason": meta.get("fallback_reason"),
+        }
+        self._pending_decisions.append(decision_data)
 
         with self._shared_lock:
             self.state.decision_records.append(
