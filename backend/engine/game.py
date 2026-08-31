@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import os
-import time
 from collections import Counter
 from random import Random
 from typing import Any
@@ -691,11 +690,26 @@ class WerewolfGame:
             return
         if decision.target_id == self.state.night_actions.last_guard_target_id:
             self._log_decision(decision, "private", {"ignored": True, "reason": "guard_cannot_repeat"}, [guard.id])
+            with self._shared_lock:
+                saved = self.state.phase
+                self.state.phase = Phase.NIGHT_GUARD_ACTION
+                self._log(EventType.NIGHT_ACTION, "public", {
+                    "action_type": "skip", "actor_name": guard.name, "reason": "guard_cannot_repeat",
+                })
+                self.state.phase = saved
             self._mark_phase_done(Phase.NIGHT_GUARD_ACTION)
             return
         self.state.night_actions.guard_target_id = decision.target_id
         self.state.night_actions.last_guard_target_id = decision.target_id
         self._log_decision(decision, "private", {"target_id": decision.target_id}, [guard.id])
+        target = self.state.player(decision.target_id)
+        with self._shared_lock:
+            saved = self.state.phase
+            self.state.phase = Phase.NIGHT_GUARD_ACTION
+            self._log(EventType.NIGHT_ACTION, "public", {
+                "action_type": "guard", "actor_name": guard.name, "target": target.public_dict(),
+            })
+            self.state.phase = saved
         self._mark_phase_done(Phase.NIGHT_GUARD_ACTION)
 
     def _wolf_phase(self) -> None:
@@ -801,6 +815,10 @@ class WerewolfGame:
                     self.state.abilities.witch_heal_used = True
                     self.state.night_actions.witch_save = True
                     self._log_decision(decision, "private", {"target_id": decision.target_id}, [witch.id])
+                    victim = self.state.player(victim_id)
+                    self._log(EventType.NIGHT_ACTION, "public", {
+                        "action_type": "witch_save", "actor_name": witch.name, "target": victim.public_dict(),
+                    })
                 else:
                     logger.warning(f"Witch {witch.name} save rejected: validator failed")
             elif decision.action_type == ActionType.WITCH_POISON:
@@ -811,10 +829,17 @@ class WerewolfGame:
                     self.state.abilities.witch_poison_used = True
                     self.state.night_actions.witch_poison_target_id = decision.target_id
                     self._log_decision(decision, "private", {"target_id": decision.target_id}, [witch.id])
+                    poison_target = self.state.player(decision.target_id)
+                    self._log(EventType.NIGHT_ACTION, "public", {
+                        "action_type": "witch_poison", "actor_name": witch.name, "target": poison_target.public_dict(),
+                    })
                 else:
                     logger.warning(f"Witch {witch.name} poison rejected: validator failed")
             elif decision.action_type == ActionType.SKIP:
                 self._log_decision(decision, "private", {"skipped": True}, [witch.id])
+                self._log(EventType.NIGHT_ACTION, "public", {
+                    "action_type": "skip", "actor_name": witch.name, "target": None,
+                })
         self._mark_phase_done(Phase.NIGHT_WITCH_ACTION)
 
     def _seer_phase(self) -> None:
@@ -841,6 +866,14 @@ class WerewolfGame:
         self.state.night_actions.seer_result = result
         self._log_decision(decision, "private", {"target_id": target.id}, [seer.id])
         self._log(EventType.PRIVATE_INFO, "private", result, visible_to=[seer.id])
+        with self._shared_lock:
+            saved = self.state.phase
+            self.state.phase = Phase.NIGHT_SEER_ACTION
+            self._log(EventType.NIGHT_ACTION, "public", {
+                "action_type": "divine", "actor_name": seer.name, "target": target.public_dict(),
+                "is_wolf": target.alignment == Alignment.WOLF,
+            })
+            self.state.phase = saved
         self._mark_phase_done(Phase.NIGHT_SEER_ACTION)
 
     def _night_resolve(self) -> None:
@@ -1630,7 +1663,18 @@ class WerewolfGame:
             player = players[index]
             self.state.phase_cursor[cursor_key] = index
             self.state.current_speaker_id = player.id
-            handler(player)
+            # Notify observer BEFORE LLM call so frontend sees phase transition + speaker
+            if self.observer is not None:
+                self.observer(self.state)
+            try:
+                handler(player)
+            except GamePaused:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Handler failed for {player.name} (seat={player.seat}) "
+                    f"in phase {phase.value}, skipping"
+                )
         self.state.current_speaker_id = None
         self.state.phase_cursor.pop(cursor_key, None)
 
