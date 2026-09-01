@@ -35,18 +35,16 @@ interface ApiDashboard {
 
 /* ── Experiment data ── */
 
-const TIER_ORDER = ["baseline", "anti_only", "trackc_only", "both"] as const;
+const TIER_ORDER = ["baseline", "trackc_only", "both"] as const;
 
 const TIER_META: Record<string, { name: string; desc: string; color: string }> = {
   baseline:    { name: "Baseline",    desc: "纯 MBTI + Role",              color: "#6b7280" },
-  anti_only:   { name: "Anti-Patterns", desc: "+ 静态反模式",              color: "#f59e0b" },
-  trackc_only: { name: "Track C",       desc: "+ 动态策略检索",            color: "#3b82f6" },
-  both:        { name: "Anti + Track C", desc: "完整三层",                 color: "#8b5cf6" },
+  trackc_only: { name: "Track C",       desc: "+ 策略检索（含反模式）",    color: "#3b82f6" },
+  both:        { name: "Track C + Anti", desc: "+ 完整反模式层",           color: "#8b5cf6" },
 };
 
 const EXPERIMENT: Record<string, { games: number; village: number; wolf: number }> = {
   baseline:    { games: 18, village: 33.3, wolf: 66.7 },
-  anti_only:   { games: 20, village: 20.0, wolf: 80.0 },
   trackc_only: { games: 13, village: 30.8, wolf: 69.2 },
   both:        { games: 13, village: 23.1, wolf: 76.9 },
 };
@@ -134,19 +132,8 @@ export default function EvolutionPage() {
   const cards = (api?.active_versions || []).filter(c => c.status === "active");
   const acceptance = api?.acceptance_metrics || [];
 
-  // Only show active knowledge with de-identified, abstracted strategy content
-  const knowledge = useMemo(() => {
-    const raw = api?.knowledge || [];
-    return raw.filter(k => {
-      if (k.status !== "active") return false;
-      const text = bestDisplayText(k);
-      if (!text || isEnglishOnly(text)) return false;
-      // Filter out raw game data: seat numbers (#号) and player names
-      if (/\d+号/.test(text)) return false;
-      if (/[顾景行苗信夏知霁川袁汐大壮宋知野]/.test(text)) return false;
-      return true;
-    });
-  }, [api?.knowledge]);
+  // API now returns only active+CN+dedup+de-identified knowledge
+  const knowledge = api?.knowledge || [];;
 
   // Group cards by faction
   const godCards = cards.filter(c => GOD_ROLES.includes(c.role as any));
@@ -224,9 +211,8 @@ export default function EvolutionPage() {
               <div className="grid grid-cols-4 gap-3 text-center">
                 {[
                   ["Baseline 狼人胜率", `${EXPERIMENT.baseline.wolf}%`],
-                  ["Anti-Patterns 增量", `+${(EXPERIMENT.anti_only.wolf-EXPERIMENT.baseline.wolf).toFixed(0)}pp`],
                   ["Track C 独立增量", `${delta(EXPERIMENT.trackc_only.wolf, EXPERIMENT.baseline.wolf)}`],
-                  ["完整三层胜率", `${EXPERIMENT.both.wolf}%`],
+                  ["Track C + Anti 胜率", `${EXPERIMENT.both.wolf}%`],
                 ].map(([label, value]) => (
                   <div key={label} className="rounded border p-3" style={{ borderColor:"var(--color-border)" }}>
                     <p className="text-xl font-bold">{value}</p><p className="text-[10px] text-text-sub">{label}</p>

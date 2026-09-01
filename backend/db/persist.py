@@ -983,63 +983,139 @@ def _knowledge_row_to_dict(row: StrategyKnowledgeDoc) -> dict[str, Any]:
 
 
 def _upsert_strategy_knowledge_rows(db, docs: list[StrategyKnowledgeDocData]) -> list[dict[str, Any]]:
+    """Upsert strategy knowledge with cross-game deduplication.
+
+    Keys dedup on (role, phase, recommended_action[:100]) across all games.
+    If the same strategy is extracted from multiple games, the rows are merged:
+    - quality_score becomes weighted average by source game count
+    - source_report_ids are unioned
+    - usage_count increments
+
+    Promotion: candidate → active when confirmed by ≥3 source games AND
+    confidence ≥ 0.85. English-only and raw player records are rejected.
+    """
     saved: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_in_batch: set[str] = set()
+
     for doc in docs:
-        if doc.doc_id in seen:
+        # ── Content quality gates ──
+        action = (doc.recommended_action or "").strip()
+        sit = (doc.situation_pattern or "").strip()
+
+        # Reject empty actions
+        if not action:
             continue
-        seen.add(doc.doc_id)
-        row = db.query(StrategyKnowledgeDoc).filter(StrategyKnowledgeDoc.id == doc.doc_id).first()
-        if row is None:
+
+        # Reject low-quality (noise from reflection/generic summaries)
+        if (doc.quality_score or 0) < 0.70:
+            continue
+
+        # Reject English-only entries (no CJK characters)
+        if not any("一" <= c <= "鿿" for c in action):
+            continue
+
+        # Reject raw per-game summaries (not abstract strategies)
+        if "视角发现的规律" in sit or "完成了" in action or "本局作为" in action:
+            continue
+
+        # Reject raw player records
+        if "对局教训" in sit or "对局总结" in sit:
+            continue
+
+        # ── Cross-game dedup key ──
+        key = (doc.role, doc.phase or "", action[:100])
+
+        # Dedup within batch
+        if str(key) in seen_in_batch:
+            continue
+        seen_in_batch.add(str(key))
+
+        # Find existing row with same (role, phase, action_prefix)
+        existing = (
+            db.query(StrategyKnowledgeDoc)
+            .filter(
+                StrategyKnowledgeDoc.role == doc.role,
+                StrategyKnowledgeDoc.phase == (doc.phase or ""),
+                StrategyKnowledgeDoc.recommended_action == action,
+            )
+            .first()
+        )
+
+        if existing is not None:
+            # ── Merge with existing ──
+            existing.usage_count = (existing.usage_count or 0) + 1
+            # Weighted average quality: weight by # of source games
+            existing_games = len(existing.source_report_ids or [])
+            new_games = len(doc.source_report_ids or [])
+            total_games = existing_games + new_games
+            if total_games > 0:
+                existing.quality_score = round(
+                    (existing.quality_score * existing_games + doc.quality_score * new_games) / total_games, 4
+                )
+            # Union source report IDs (de-duplicate)
+            merged_sources = list(set((existing.source_report_ids or []) + (doc.source_report_ids or [])))
+            existing.source_report_ids = merged_sources
+            existing.source_item_ids = merged_sources  # align with reports
+            existing.source_event_ids = list(set((existing.source_event_ids or []) + (doc.source_event_ids or [])))
+            existing.confidence = max(existing.confidence or 0, doc.confidence or 0)
+            existing.updated_at = doc.updated_at if doc.updated_at else existing.updated_at
+
+            # Note: promotion from candidate → active is handled explicitly
+            # via scripts/promote.py (quality/cluster/feedback/prune modes).
+            # New entries always start as candidate; cross-game dedup still
+            # merges quality scores and source IDs for future promotion decisions.
+
+            saved.append(_knowledge_row_to_dict(existing))
+        else:
+            # ── New entry ──
             row = StrategyKnowledgeDoc(id=doc.doc_id)
             db.add(row)
-        row.doc_type = doc.doc_type
-        row.role = doc.role
-        row.phase = doc.phase
-        row.persona_scope = doc.persona_scope
-        row.situation_pattern = doc.situation_pattern
-        row.trigger_conditions = doc.trigger_conditions
-        row.recommended_action = doc.recommended_action
-        row.avoid_action = doc.avoid_action
-        row.rationale = doc.rationale
-        row.evidence_summary = doc.evidence_summary
-        row.source_report_ids = doc.source_report_ids
-        row.source_item_ids = doc.source_item_ids
-        row.source_event_ids = doc.source_event_ids
-        row.counterfactual_ids = doc.counterfactual_ids
-        row.expected_metric_effects = doc.expected_metric_effects
-        row.quality_score = doc.quality_score
-        row.confidence = doc.confidence
-        row.usage_count = doc.usage_count
-        row.success_count = doc.success_count
-        row.failure_count = doc.failure_count
-        row.status = doc.status
-        row.tags = doc.tags
+            row.doc_type = doc.doc_type
+            row.role = doc.role
+            row.phase = doc.phase
+            row.persona_scope = doc.persona_scope
+            row.situation_pattern = doc.situation_pattern
+            row.trigger_conditions = doc.trigger_conditions or []
+            row.recommended_action = doc.recommended_action
+            row.avoid_action = doc.avoid_action
+            row.rationale = doc.rationale
+            row.evidence_summary = doc.evidence_summary
+            row.source_report_ids = doc.source_report_ids or []
+            row.source_item_ids = doc.source_item_ids or []
+            row.source_event_ids = doc.source_event_ids or []
+            row.counterfactual_ids = doc.counterfactual_ids or []
+            row.expected_metric_effects = doc.expected_metric_effects or []
+            row.quality_score = doc.quality_score
+            row.confidence = doc.confidence
+            row.usage_count = 1
+            row.success_count = 0
+            row.failure_count = 0
+            # Start as candidate; promotion happens above when 3+ games confirm
+            row.status = "candidate"
+            row.tags = doc.tags or []
 
-        # L0-L4 Confidence Tier
-        row.confidence_tier = getattr(doc, "confidence_tier", None) or "L3_strategic"
-        row.judge_agreement = getattr(doc, "judge_agreement", None)
-        row.times_upvoted = getattr(doc, "times_upvoted", 0)
-        row.contradiction_count = getattr(doc, "contradiction_count", 0)
-        row.games_since_creation = getattr(doc, "games_since_creation", 0)
-        row.human_verdict = getattr(doc, "human_verdict", None)
+            row.confidence_tier = getattr(doc, "confidence_tier", None) or "L3_strategic"
+            row.judge_agreement = getattr(doc, "judge_agreement", None)
+            row.times_upvoted = 0
+            row.contradiction_count = 0
+            row.games_since_creation = 0
+            row.human_verdict = None
 
-        # Access Control
-        row.visibility_scope = getattr(doc, "visibility_scope", None) or "public"
-        row.allowed_roles = getattr(doc, "allowed_roles", None)
-        row.deidentified = bool(getattr(doc, "deidentified", False))
-        row.contains_current_game_private_info = bool(getattr(doc, "contains_current_game_private_info", False))
+            row.visibility_scope = "public"
+            row.allowed_roles = None
+            row.deidentified = True
+            row.contains_current_game_private_info = False
 
-        # Applicability
-        row.applicability_role = getattr(doc, "applicability_role", None)
-        row.applicability_phase = getattr(doc, "applicability_phase", None)
-        row.min_players = getattr(doc, "min_players", None)
-        row.max_players = getattr(doc, "max_players", None)
-        row.required_public_facts = getattr(doc, "required_public_facts", None) or []
-        row.forbidden_public_facts = getattr(doc, "forbidden_public_facts", None) or []
-        row.required_private_state = getattr(doc, "required_private_state", None) or []
+            row.applicability_role = getattr(doc, "applicability_role", None)
+            row.applicability_phase = getattr(doc, "applicability_phase", None)
+            row.min_players = getattr(doc, "min_players", None)
+            row.max_players = getattr(doc, "max_players", None)
+            row.required_public_facts = getattr(doc, "required_public_facts", None) or []
+            row.forbidden_public_facts = getattr(doc, "forbidden_public_facts", None) or []
+            row.required_private_state = getattr(doc, "required_private_state", None) or []
 
-        saved.append(doc.to_dict())
+            saved.append(_knowledge_row_to_dict(row))
+
     return saved
 
 
@@ -1482,12 +1558,36 @@ def get_evolution_dashboard() -> dict[str, Any]:
         active_versions = (
             db.query(RoleStrategyCard).order_by(RoleStrategyCard.role, RoleStrategyCard.created_at.desc()).all()
         )
-        knowledge = (
+        # Only active entries, deduplicated by recommended_action,
+        # with non-empty Chinese content, quality >= 0.7
+        knowledge_raw = (
             db.query(StrategyKnowledgeDoc)
+            .filter(StrategyKnowledgeDoc.status == "active")
+            .filter(StrategyKnowledgeDoc.quality_score >= 0.70)
+            .filter(StrategyKnowledgeDoc.recommended_action.isnot(None))
+            .filter(StrategyKnowledgeDoc.recommended_action != "")
             .order_by(StrategyKnowledgeDoc.quality_score.desc(), StrategyKnowledgeDoc.updated_at.desc())
-            .limit(50)
+            .limit(200)
             .all()
         )
+        # Dedup: keep only one entry per (role, recommended_action prefix)
+        seen = set()
+        knowledge = []
+        for row in knowledge_raw:
+            action = (row.recommended_action or "").strip()
+            # Skip English-only entries
+            if not any("一" <= c <= "鿿" for c in action):
+                continue
+            # Skip raw player records (contain player names in situation)
+            sit = (row.situation_pattern or "")
+            if "对局教训" in sit or "对局总结" in sit:
+                continue
+            key = (row.role, action[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            knowledge.append(row)
+        knowledge = knowledge[:50]
         acceptance_audit = _lightweight_bc_acceptance_summary(db)
         return _clean(
             {

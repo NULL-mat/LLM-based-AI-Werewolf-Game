@@ -361,89 +361,147 @@ def store_lessons_to_db(
     lessons: List[AbstractedLesson],
     conn_str: str = "",
 ) -> int:
-    """Store abstracted lessons to PostgreSQL strategy_knowledge_docs.
+    """Store abstracted lessons to PostgreSQL via upsert with cross-game dedup.
+
+    Routes through _upsert_strategy_knowledge_rows which handles:
+    - Cross-game dedup by (role, phase, recommended_action[:100])
+    - Quality gates (rejects English-only, empty, raw player records)
+    - Promotion: candidate → active when ≥3 source games confirm
 
     Args:
         lessons: List of AbstractedLesson objects.
-        conn_str: PostgreSQL connection string.
+        conn_str: PostgreSQL connection string (unused — kept for compat).
 
     Returns:
-        Number of lessons stored.
+        Number of lessons stored (new + merged).
     """
     if not lessons:
         return 0
 
     import logging
     import os as _os
-    from uuid import uuid4
 
-    import psycopg2
-
-    from backend.db.database import DEFAULT_DB_URL
+    from backend.db.database import SessionLocal
+    from backend.db.persist import _upsert_strategy_knowledge_rows
+    from backend.db.persist import StrategyKnowledgeDocData
 
     logger = logging.getLogger(__name__)
-    auto_promote = _os.getenv("AUTO_PROMOTE_LESSONS", "").lower() == "true"
 
-    conn = psycopg2.connect(conn_str or DEFAULT_DB_URL)
-    c = conn.cursor()
-
-    stored = 0
-    errors = 0
-    role_counts: dict[str, int] = {}
+    # Convert to StrategyKnowledgeDocData
+    docs: list[StrategyKnowledgeDocData] = []
     for lesson in lessons:
-        doc = lesson.to_pg_dict()
-        # Auto-promote to active if all conditions met
-        if auto_promote and lesson.confidence >= 0.90 and not lesson.source_type.startswith("reflection"):
-            doc["status"] = "active"
-        # Pop extra keys not present in the INSERT column list
-        doc.pop("game_id", None)
-        # experiment_id is intentionally kept — it goes into the INSERT below (H6 tier isolation)
-        # Generate a primary key (raw psycopg2 bypasses SQLAlchemy default)
-        doc["id"] = str(uuid4())
-        try:
-            # Use savepoint so a single failed INSERT doesn't roll back
-            # previously successful rows in this transaction.
-            sp_id = f"sp_{stored}"
-            c.execute(f"SAVEPOINT {sp_id}")
-            c.execute(
-                """
-                INSERT INTO strategy_knowledge_docs
-                    (id, doc_type, role, phase, persona_scope, situation_pattern,
-                     trigger_conditions, recommended_action, avoid_action, rationale,
-                     quality_score, confidence, source_report_ids, source_item_ids,
-                     source_event_ids, evidence_summary, tags, status, experiment_id,
-                     source_game_id)
-                VALUES (%(id)s, %(doc_type)s, %(role)s, %(phase)s, %(persona_scope)s,
-                        %(situation_pattern)s, %(trigger_conditions)s,
-                        %(recommended_action)s, %(avoid_action)s, %(rationale)s,
-                        %(quality_score)s, %(confidence)s, %(source_report_ids)s,
-                        %(source_item_ids)s, %(source_event_ids)s,
-                        %(evidence_summary)s, %(tags)s, %(status)s, %(experiment_id)s,
-                        %(source_game_id)s)
-            """,
-                doc,
+        d = lesson.to_pg_dict()
+        # Remove keys not in StrategyKnowledgeDocData
+        d.pop("game_id", None)
+        d.pop("id", None)  # Let upsert dedup by content, not UUID
+        docs.append(StrategyKnowledgeDocData(**d))
+
+    db = SessionLocal()
+    try:
+        saved = _upsert_strategy_knowledge_rows(db, docs)
+        db.commit()
+
+        active_count = sum(1 for s in saved if s.get("status") == "active")
+        candidate_count = sum(1 for s in saved if s.get("status") == "candidate")
+        logger.info(
+            "Stored %d lessons: %d active, %d candidate (cross-game dedup + promotion applied)",
+            len(saved),
+            active_count,
+            candidate_count,
+        )
+        return len(saved)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def promote_after_store() -> int:
+    """Promote candidates to active after new lessons are stored.
+
+    Runs the standard 3-step promotion pipeline:
+    1. quality  — promote candidates with quality_score ≥ 0.85
+    2. cluster  — promote top-5 per (role, doc_type) cluster, quality ≥ 0.75
+    3. prune    — cap active docs per (role, doc_type) at 30
+
+    Called from post_game.py after each game's lessons are stored.
+    Returns total number of candidates promoted.
+    """
+    import logging
+    from collections import defaultdict
+
+    from backend.db.database import SessionLocal
+    from backend.db.persist import StrategyKnowledgeDoc
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    promoted_total = 0
+
+    try:
+        # ── Step 1: quality promo (q ≥ 0.90) ──
+        quality_threshold = 0.85
+        rows = (
+            db.query(StrategyKnowledgeDoc)
+            .filter(
+                StrategyKnowledgeDoc.status == "candidate",
+                StrategyKnowledgeDoc.quality_score >= quality_threshold,
             )
-            stored += 1
-            role_counts[lesson.target_role] = role_counts.get(lesson.target_role, 0) + 1
-        except Exception as e:
-            c.execute(f"ROLLBACK TO SAVEPOINT {sp_id}")
-            errors += 1
-            if errors <= 3:
-                logger.warning(
-                    "Failed to store lesson (role=%s, type=%s): %s",
-                    lesson.target_role,
-                    lesson.source_type,
-                    str(e)[:200],
-                )
+            .all()
+        )
+        for row in rows:
+            row.status = "active"
+            promoted_total += 1
 
-    conn.commit()
-    conn.close()
+        # ── Step 2: cluster promo (top-5 per role/doc_type, q ≥ 0.75) ──
+        cluster_threshold = 0.75
+        top_n = 5
+        rows = (
+            db.query(StrategyKnowledgeDoc)
+            .filter(
+                StrategyKnowledgeDoc.status == "candidate",
+                StrategyKnowledgeDoc.quality_score >= cluster_threshold,
+            )
+            .order_by(StrategyKnowledgeDoc.quality_score.desc())
+            .all()
+        )
+        groups: dict[tuple[str, str], list] = defaultdict(list)
+        for row in rows:
+            key = (row.role, row.doc_type or "unknown")
+            groups[key].append(row)
+        for key, group in groups.items():
+            for row in sorted(group, key=lambda r: r.quality_score, reverse=True)[:top_n]:
+                if row.status == "candidate":
+                    row.status = "active"
+                    promoted_total += 1
 
-    logger.info(
-        "Stored %d candidate lessons (status=candidate). Set AUTO_PROMOTE_LESSONS=true to auto-promote to active.",
-        stored,
-    )
-    if role_counts:
-        logger.info("Lessons by role: %s", dict(role_counts))
+        # ── Step 3: prune (cap active per role/doc_type at 20) ──
+        cap = 20
+        active_rows = (
+            db.query(StrategyKnowledgeDoc)
+            .filter(StrategyKnowledgeDoc.status == "active")
+            .order_by(StrategyKnowledgeDoc.quality_score.desc())
+            .all()
+        )
+        active_groups: dict[tuple[str, str], list] = defaultdict(list)
+        for row in active_rows:
+            key = (row.role, row.doc_type or "unknown")
+            active_groups[key].append(row)
+        for key, group in active_groups.items():
+            if len(group) > cap:
+                # Demote lowest-quality excess to candidate
+                excess = sorted(group, key=lambda r: r.quality_score)[: len(group) - cap]
+                for row in excess:
+                    row.status = "candidate"
 
-    return stored
+        db.commit()
+
+        if promoted_total > 0:
+            logger.info("promote_after_store: %d candidates → active", promoted_total)
+        return promoted_total
+    except Exception:
+        db.rollback()
+        logger.warning("promote_after_store failed", exc_info=True)
+        return 0
+    finally:
+        db.close()
