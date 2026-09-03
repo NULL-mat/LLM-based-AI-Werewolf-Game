@@ -246,7 +246,8 @@ tsconfig.tsbuildinfo
 data/
 wolf/
 prototype/
-models/open_data/
+models/
+logs/
 
 # Reference images (large, not code)
 frontend/photos/
@@ -303,6 +304,9 @@ backups/
 # Root-level experiment/result JSON artifacts
 /*.json
 outputs/
+
+# Local provider probes; canonical preflight evidence is docs/PROJECT_PROVIDER_PREFLIGHT.json
+docs/PROJECT_PROVIDER_PREFLIGHT.*_probe.json
 
 # Screenshots
 *.png
