@@ -74,9 +74,175 @@ def test_hybrid_policy_keeps_global_in_global_bucket() -> None:
     )
 
     by_id = {item["doc_id"]: item for item in results}
-    assert list(by_id) == ["seer-intj", "seer-enfp", "global-check"]
+    assert list(by_id) == ["seer-intj", "global-check"]
     assert by_id["seer-intj"]["bucket"] == "same_role_same_mbti"
+    assert by_id["global-check"]["bucket"] == "global"
+
+
+def test_hybrid_policy_allows_cross_mbti_role_fill_only_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TRACK_C_ALLOW_CROSS_MBTI_ROLE_FILL", "1")
+
+    results = _retriever().search_with_keywords(
+        ["查杀"],
+        role="Seer",
+        phase="DAY_SPEECH",
+        k=3,
+        retrieval_policy=RetrievalPolicy.HYBRID_ROLE_MBTI_GLOBAL,
+        agent_context=_ctx("INTJ"),
+    )
+
+    by_id = {item["doc_id"]: item for item in results}
+    assert list(by_id) == ["seer-intj", "seer-enfp", "global-check"]
     assert by_id["seer-enfp"]["bucket"] == "same_role_all_mbti"
+
+
+def test_hybrid_policy_uses_role_generic_docs_without_cross_mbti() -> None:
+    retriever = StrategyRetriever()
+    assert (
+        retriever.build_from_docs(
+            [
+                {
+                    "doc_id": "seer-intj",
+                    "situation": "查杀 表水 预言家",
+                    "strategy": "INTJ 预言家策略",
+                    "role": "Seer",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.95,
+                    "persona_scope": "mbti:INTJ+role:Seer",
+                },
+                {
+                    "doc_id": "seer-generic",
+                    "situation": "查杀 表水 预言家",
+                    "strategy": "通用预言家策略",
+                    "role": "Seer",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.94,
+                },
+                {
+                    "doc_id": "seer-enfp",
+                    "situation": "查杀 表水 预言家",
+                    "strategy": "ENFP 预言家策略",
+                    "role": "Seer",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.93,
+                    "persona_scope": "mbti:ENFP+role:Seer",
+                },
+            ]
+        )
+        == 3
+    )
+
+    results = retriever.search_with_keywords(
+        ["查杀"],
+        role="Seer",
+        phase="DAY_SPEECH",
+        k=3,
+        retrieval_policy=RetrievalPolicy.HYBRID_ROLE_MBTI_GLOBAL,
+        agent_context=_ctx("INTJ"),
+    )
+
+    assert [item["doc_id"] for item in results] == ["seer-intj", "seer-generic"]
+    assert results[1]["bucket"] == "same_role_all_mbti"
+
+
+def test_hybrid_policy_prefers_validated_canonical_later_strategy_version() -> None:
+    retriever = StrategyRetriever()
+    assert (
+        retriever.build_from_docs(
+            [
+                {
+                    "doc_id": "seer-v1",
+                    "situation": "查杀 表水 预言家",
+                    "strategy": "旧版预言家查杀表水策略",
+                    "role": "Seer",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.95,
+                    "confidence": 0.85,
+                    "knowledge_epoch": 1,
+                    "doc_version": "seer_v1",
+                    "maturity": "refined",
+                    "validated_at": "2026-05-20T00:00:00+00:00",
+                },
+                {
+                    "doc_id": "seer-v3",
+                    "situation": "查杀 表水 预言家",
+                    "strategy": "新版预言家查杀表水策略",
+                    "role": "Seer",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.90,
+                    "confidence": 0.88,
+                    "knowledge_epoch": 3,
+                    "doc_version": "seer_v3",
+                    "maturity": "canonical",
+                    "validated_at": "2026-06-08T00:00:00+00:00",
+                },
+            ]
+        )
+        == 2
+    )
+
+    results = retriever.search_with_keywords(
+        ["查杀"],
+        role="Seer",
+        phase="DAY_SPEECH",
+        k=2,
+        retrieval_policy=RetrievalPolicy.SAME_ROLE_ALL_MBTI,
+        agent_context=_ctx("INTJ"),
+    )
+
+    assert [item["doc_id"] for item in results] == ["seer-v3", "seer-v1"]
+    assert results[0]["maturity"] == "canonical"
+    assert results[0]["knowledge_epoch"] == 3
+    assert results[0]["strategy_rank_score"] > results[1]["strategy_rank_score"]
+
+
+def test_hybrid_alignment_phase_rejects_cross_mbti_alignment_fill() -> None:
+    retriever = StrategyRetriever()
+    assert (
+        retriever.build_from_docs(
+            [
+                {
+                    "doc_id": "witch-enfp",
+                    "situation": "查杀 表水 女巫",
+                    "strategy": "ENFP 女巫阵营经验",
+                    "role": "Witch",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.95,
+                    "persona_scope": "mbti:ENFP+role:Witch",
+                },
+                {
+                    "doc_id": "village-generic",
+                    "situation": "查杀 表水 好人阵营",
+                    "strategy": "好人阵营通用经验",
+                    "role": "Witch",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.93,
+                },
+                {
+                    "doc_id": "global-check",
+                    "situation": "查杀 表水 通用",
+                    "strategy": "通用查杀表水策略",
+                    "role": "global",
+                    "phase": "DAY_SPEECH",
+                    "quality": 0.90,
+                },
+            ]
+        )
+        == 3
+    )
+
+    results = retriever.search_with_keywords(
+        ["查杀"],
+        role="Seer",
+        phase="DAY_SPEECH",
+        k=3,
+        retrieval_policy=RetrievalPolicy.HYBRID_ROLE_ALIGNMENT_PHASE,
+        agent_context=_ctx("INTJ"),
+    )
+
+    by_id = {item["doc_id"]: item for item in results}
+    assert "witch-enfp" not in by_id
+    assert by_id["village-generic"]["bucket"] == "same_alignment_all_mbti"
     assert by_id["global-check"]["bucket"] == "global"
 
 
