@@ -5,10 +5,16 @@ import json
 import pytest
 
 from scripts.target_seat_trackc_ab_experiment import TargetGameSubprocessError
+from scripts.target_seat_trackc_ab_experiment import TargetOutputLockError
+from scripts.target_seat_trackc_ab_experiment import acquire_output_file_lock
 from scripts.target_seat_trackc_ab_experiment import build_failure_record
 from scripts.target_seat_trackc_ab_experiment import completed_sides_by_seed
 from scripts.target_seat_trackc_ab_experiment import load_previous_failures
 from scripts.target_seat_trackc_ab_experiment import load_previous_results
+from scripts.target_seat_trackc_ab_experiment import merge_sidecar_failures
+from scripts.target_seat_trackc_ab_experiment import merge_sidecar_results
+from scripts.target_seat_trackc_ab_experiment import read_jsonl_rows
+from scripts.target_seat_trackc_ab_experiment import release_output_file_lock
 from scripts.target_seat_trackc_ab_experiment import result_seeds
 from scripts.target_seat_trackc_ab_experiment import run_target_game_with_optional_timeout
 from scripts.target_seat_trackc_ab_experiment import validate_resume_payload
@@ -95,6 +101,55 @@ def test_resume_helpers_dedupe_completed_sides_and_write_jsonl(tmp_path) -> None
     write_jsonl_rows(out, [*baseline, *candidate])
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert rows == [*baseline, *candidate]
+    assert read_jsonl_rows(out) == [*baseline, *candidate]
+
+
+def test_append_resume_merges_sidecar_jsonl_when_main_json_lags(tmp_path) -> None:
+    games_jsonl = tmp_path / "target.games.jsonl"
+    write_jsonl_rows(
+        games_jsonl,
+        [
+            {"seed": 9301, "side": "baseline", "value": "main-duplicate"},
+            {"seed": 9302, "side": "baseline", "value": "sidecar-new"},
+            {"seed": 9302, "side": "candidate", "value": "sidecar-new"},
+        ],
+    )
+
+    baseline, candidate, row_count = merge_sidecar_results(
+        [{"seed": 9301, "side": "baseline", "value": "main"}],
+        [{"seed": 9301, "side": "candidate", "value": "main"}],
+        games_jsonl,
+    )
+
+    assert row_count == 3
+    assert completed_sides_by_seed(baseline, candidate).keys() == {
+        (9301, "baseline"),
+        (9301, "candidate"),
+        (9302, "baseline"),
+        (9302, "candidate"),
+    }
+    assert next(row for row in baseline if row["seed"] == 9301)["value"] == "main-duplicate"
+
+
+def test_append_resume_merges_sidecar_failures_when_main_json_lags(tmp_path) -> None:
+    failures_jsonl = tmp_path / "target.failures.jsonl"
+    write_jsonl_rows(
+        failures_jsonl,
+        [
+            {"seed": 9301, "side": "baseline", "error_type": "Timeout", "error": "sidecar"},
+            {"seed": 9302, "side": "candidate", "error_type": "RuntimeError", "error": "new"},
+        ],
+    )
+
+    failures, row_count = merge_sidecar_failures(
+        [{"seed": 9301, "side": "baseline", "error_type": "Timeout", "error": "main"}],
+        failures_jsonl,
+    )
+
+    assert row_count == 2
+    by_key = {(row["seed"], row["side"], row["error_type"]): row for row in failures}
+    assert by_key[(9301, "baseline", "Timeout")]["error"] == "sidecar"
+    assert by_key[(9302, "candidate", "RuntimeError")]["error"] == "new"
 
 
 def test_write_partial_includes_long_run_metadata(tmp_path) -> None:
@@ -179,3 +234,20 @@ def test_target_game_failure_record_is_structured() -> None:
     assert record["traceback"] == "traceback text"
     assert record["external_failure"] is True
     assert record["timeout_s"] == 30
+
+
+def test_output_file_lock_blocks_second_writer_and_releases(tmp_path) -> None:
+    output_path = tmp_path / "target_seat_ab_Seer.json"
+    first = acquire_output_file_lock(output_path)
+    try:
+        assert first.path == output_path.with_suffix(".json.lock")
+        assert first.path.exists()
+        assert str(output_path) in first.path.read_text(encoding="utf-8")
+
+        with pytest.raises(TargetOutputLockError, match="already locked"):
+            acquire_output_file_lock(output_path)
+    finally:
+        release_output_file_lock(first)
+
+    second = acquire_output_file_lock(output_path)
+    release_output_file_lock(second)

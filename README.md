@@ -1,7 +1,7 @@
 # AI Werewolf
 
 <p align="center">
-  <img src="docs/assets/closure/ai-werewolf-icon.svg" alt="AI Werewolf logo" width="112">
+  <img src="docs/assets/ai-werewolf-icon.svg" alt="AI Werewolf logo" width="112">
 </p>
 
 <p align="center">
@@ -14,10 +14,6 @@
 [![CI](https://img.shields.io/badge/CI-lint%20%2B%20test-brightgreen)](.github/workflows/ci.yml)
 [![PostgreSQL](https://img.shields.io/badge/db-PostgreSQL%2016-336791?logo=postgresql)](https://www.postgresql.org/)
 [![Next.js](https://img.shields.io/badge/frontend-Next.js%2014-black?logo=next.js)](https://nextjs.org/)
-
-<p align="center">
-  <img src="docs/assets/readme/readme-system-architecture.jpg" alt="AI Werewolf system architecture" width="920">
-</p>
 
 ## 项目定位
 
@@ -32,13 +28,9 @@ AI Werewolf 是一个面向多智能体博弈研究和工程展示的狼人杀�
 | Evolve | Track C 抽取策略知识，维护 `candidate -> active -> deprecated` 生命周期，并通过 `StrategyRetriever` 回流下一局 Agent |
 | Interaction | Next.js 前端提供大厅、观战、真人操作、人格配置、单局复盘和统计看板 |
 
-最终展示报告见 [`docs/FINAL_SHOWCASE_REPORT.md`](docs/FINAL_SHOWCASE_REPORT.md)，完整工程架构图谱见 [`docs/ENGINEERING_ARCHITECTURE.md`](docs/ENGINEERING_ARCHITECTURE.md)。
+完整工程架构图谱见 [`docs/ENGINEERING_ARCHITECTURE.md`](docs/ENGINEERING_ARCHITECTURE.md)，核心模块说明见 [`docs/PROJECT_MODULE_DESIGN.md`](docs/PROJECT_MODULE_DESIGN.md)。
 
 ## 分层架构
-
-<p align="center">
-  <img src="docs/assets/readme/readme-play-evaluate-evolve.jpg" alt="Play Evaluate Evolve loop" width="860">
-</p>
 
 ```mermaid
 flowchart TB
@@ -102,28 +94,16 @@ flowchart TB
 | 前端体验 | `frontend/app/`, `frontend/components/`, `frontend/hooks/` | 大厅、观战、真人操作、复盘、人格配置 |
 | 持久化 | `backend/db/models.py`, `backend/db/persist.py` | 对局、事件、决策、报告、策略知识和指标 |
 
-## 最新结果
+## 项目能力
 
-| 方向 | 当前结果 |
-|---|---:|
-| 本地数据库 games | 11,730 |
-| 本地数据库 agent_decisions | 302,291 |
-| 本地数据库 published_reviews | 4,955 |
-| 本地数据库 strategy_knowledge_docs | 217,310 |
-| 真实 LLM 完成对局 | 78 |
-| 真实 LLM 决策 | 1,936 |
-| strict formal completed games | 34 |
-| strict formal fallback / invalid | 0 / 0 |
-| Track B showcase 完成对局 | 6 |
-| 单角色检索 Coverage | 100.00% |
-| 单角色检索 Effective@3 | 50.00% |
-| 策略使用决策质量差异 | +0.0823 |
-| Target-seat Seer paired pipeline pilot | 20 pairs |
-| Target-seat Seer adjusted delta | +6.0120 |
-| Target-seat Seer role-task delta | +0.1008 |
-| Target-seat candidate fallback / invalid | 0 / 0 |
-
-数据口径见 [`docs/evidence/README.md`](docs/evidence/README.md)。这些结果用于展示工程链路、复盘能力和策略回流趋势；target-seat 20-pair pipeline pilot 已跑通且趋势为正，但 `accepted=false`、bootstrap CI 仍跨 0，因此不写成 Track C 因果胜率提升。
+| 能力 | 说明 |
+|---|---|
+| 完整对局 | 支持多人数配置、昼夜流程、警徽、PK、遗言、猎人开枪、白狼王自爆和真人混战 |
+| 严格信息隔离 | 后端将完整状态投影为玩家私有视图和观众公开视图，Agent 只接触身份合法信息 |
+| 角色化 Agent | `CognitiveAgent` 组合角色目标、人格、记忆、社交判断、工具调用和策略检索 |
+| Track B 复盘 | 对发言、投票、夜间技能和关键转折做结构化评分、报告和排行榜聚合 |
+| Track C 进化 | 从复盘中抽取策略知识，经过 candidate/active/deprecated 生命周期后回流到后续对局 |
+| 前端演示 | Next.js 前端覆盖大厅、观战、真人操作、单局复盘、统计看板和人格配置 |
 
 ## 与常见做法的区别
 
@@ -155,7 +135,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env`，设置 `LLM_PROVIDER` 和对应 provider 的 API Key。离线测试可使用 `_TEST_ALLOW_FAKE_LLM=true LLM_PROVIDER=fake`。
+编辑 `.env`，设置 `LLM_PROVIDER` 和对应 provider 的 API Key。正式 Demo 和结果统计使用真实 LLM provider。
 
 ### 2. 启动 PostgreSQL
 
@@ -169,7 +149,7 @@ docker run -d --name werewolf-pg \
 python scripts/migrate_v2_columns.py
 ```
 
-未配置 `DATABASE_URL` 时，后端会使用 SQLite fallback，适合轻量本地验证。
+未配置 `DATABASE_URL` 时，后端会使用 SQLite 本地模式，适合轻量本地验证。
 
 ### 3. 启动后端
 
@@ -213,7 +193,7 @@ PORT=3002 npm run dev
 | 游戏引擎 | dataclass + Enum 纯逻辑规则引擎 |
 | Agent | `CognitiveAgent` / AgentLoop / Memory / SocialModel / StrategyRetriever |
 | LLM 接入 | `backend.llm.create_client()`，支持 doubao / dsv4flash / ark / deepseek / anthropic / weapi / mimo |
-| 数据库 | SQLAlchemy；PostgreSQL 优先，SQLite fallback |
+| 数据库 | SQLAlchemy；PostgreSQL 优先，支持 SQLite 本地模式 |
 | 前端 | Next.js 14 / React 18 / TypeScript / Tailwind CSS |
 | 测试与质量 | pytest / ruff / frontend lint / build / GitHub Actions |
 
@@ -221,7 +201,7 @@ PORT=3002 npm run dev
 
 | 目标 | 命令 |
 |---|---|
-| 离线后端测试 | `_TEST_ALLOW_FAKE_LLM=true LLM_PROVIDER=fake python -m pytest tests/test_api.py tests/test_cognitive_offline.py -q` |
+| 后端配置测试 | `python -m pytest tests/test_llm_config.py -q` |
 | 信息隔离专项 | `python scripts/verify_visibility_strict.py` |
 | 后端 E2E smoke | `python scripts/e2e_smoke.py` |
 | 严格模式验收 | `python scripts/run_backend_full_strict.py` |
@@ -247,41 +227,41 @@ AIwerewolf/
 ├── scripts/                   # smoke、实验、迁移、报告和验证脚本
 ├── tests/                     # pytest 和 UI smoke
 ├── configs/                   # 规则、策略和实验配置
-├── docs/                      # 架构、模块、验收、交付和图表文档
-└── docs/assets/               # 小型 SVG/HTML 展示资产
+├── docs/                      # 架构、模块、需求和参考文档
+└── docs/assets/               # README logo 等轻量项目介绍资产
 ```
 
-## 交付物索引
+## 仓库内容
 
-| 交付物 | 当前位置 |
+| 内容 | 当前位置 |
 |---|---|
 | 代码仓库 | `backend/`, `frontend/`, `scripts/`, `tests/`, `configs/` |
 | 产品原型 | Next.js 前端：大厅、观战、真人操作、复盘、人格配置 |
 | Demo 链接 | 本地后端 `http://localhost:8000/docs`，本地前端 `http://localhost:3001` |
-| 技术文档 | `docs/FINAL_SHOWCASE_REPORT.md`, `docs/ENGINEERING_ARCHITECTURE.md`, `docs/PROJECT_MODULE_DESIGN.md` |
-| 数据与结果 | `docs/evidence/README.md`, `docs/evidence/*.json`, `docs/evidence/*.md` |
-| 展示资产 | `docs/assets/final_report/*.svg`, `docs/assets/closure/*.svg` |
+| 项目介绍文档 | `docs/FINAL_SHOWCASE_REPORT.md`, `docs/FINAL_DELIVERY_PACKAGE.md`, `docs/ENGINEERING_ARCHITECTURE.md`, `docs/PROJECT_MODULE_DESIGN.md`, `docs/PROJECT_REFERENCES.md`, `docs/prd.md` |
+| 轻量展示资产 | `docs/assets/ai-werewolf-icon.svg` |
 
 ## 文档导航
 
 | 文档 | 说明 |
 |---|---|
 | [`docs/README.md`](docs/README.md) | 文档阅读顺序和归档说明 |
-| [`docs/FINAL_SHOWCASE_REPORT.md`](docs/FINAL_SHOWCASE_REPORT.md) | 最终展示用精简报告和最新关键结果 |
+| [`docs/FINAL_SHOWCASE_REPORT.md`](docs/FINAL_SHOWCASE_REPORT.md) | GitHub 粗略展示报告和核心量化概览 |
+| [`docs/FINAL_DELIVERY_PACKAGE.md`](docs/FINAL_DELIVERY_PACKAGE.md) | 仓库交付内容和清洁边界 |
 | [`docs/ENGINEERING_ARCHITECTURE.md`](docs/ENGINEERING_ARCHITECTURE.md) | 分层架构图、运行时序图、信息隔离图、数据闭环图、Track C 生命周期图 |
 | [`docs/PROJECT_MODULE_DESIGN.md`](docs/PROJECT_MODULE_DESIGN.md) | 核心模块设计与实现说明 |
-| [`docs/evidence/README.md`](docs/evidence/README.md) | 最新数据结果和证据文件索引 |
-| [`docs/FINAL_DELIVERY_PACKAGE.md`](docs/FINAL_DELIVERY_PACKAGE.md) | 最终交付包、展示路线和仓库边界 |
+| [`docs/PROJECT_REFERENCES.md`](docs/PROJECT_REFERENCES.md) | 参考项目和设计取舍 |
+| [`docs/prd.md`](docs/prd.md) | 需求和系统设计目标 |
 
 ## GitHub 仓库边界
 
-应进入仓库的是源码、测试、配置模板、CI、正式文档和小型展示资产；不应进入仓库的是 `.env`、真实 API Key、本地数据库、运行日志、`data/`、`references/`、`.venv/`、`node_modules/` 和 `.next/`。
+应进入仓库的是源码、测试、配置模板、CI、README、粗略展示文档和必要的小型 logo 资产；不应进入仓库的是 `.env`、真实 API Key、本地数据库、运行日志、实验输出、evidence 快照、截图、PPT/PDF、长篇过程材料、`data/`、`references/`、`.venv/`、`node_modules/` 和 `.next/`。
 
 提交前可检查：
 
 ```bash
 git status --short --ignored
-git ls-files | rg '(^|/)(\.env$|__pycache__/|node_modules/|\.next/|data/|models/|references/)|\.(db|log|jsonl)$'
+git ls-files | rg '(^|/)(\.env$|__pycache__/|node_modules/|\.next/|data/|models/|references/|docs/evidence/|docs/experiments/|docs/presentations/)|\.(db|log|jsonl|pptx|pdf)$'
 ```
 
 ## License

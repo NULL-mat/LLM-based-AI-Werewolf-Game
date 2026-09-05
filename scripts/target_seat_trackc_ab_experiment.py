@@ -10,6 +10,8 @@ baseline and candidate games.
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
 import json
 import multiprocessing as mp
 import os
@@ -21,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from random import Random
 from typing import Any
@@ -100,6 +103,66 @@ class TargetGameSubprocessError(RuntimeError):
         return str(self.payload.get("traceback") or "")
 
 
+@dataclass
+class OutputFileLock:
+    path: Path
+    handle: Any | None
+
+
+class TargetOutputLockError(RuntimeError):
+    """Raised when another process is already writing the same experiment output."""
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def acquire_output_file_lock(output_path: Path) -> OutputFileLock:
+    """Acquire a non-blocking lock for a target-seat output JSON.
+
+    Long target-seat runs are commonly resumed with ``--append``. A second
+    process appending to the same main JSON and sidecar JSONL files can corrupt
+    the experiment boundary, so fail fast instead of waiting or interleaving.
+    """
+
+    lock_path = output_path.with_suffix(output_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise TargetOutputLockError(
+            f"Output is already locked: {lock_path}. Another target-seat experiment may be "
+            f"writing {output_path}. Wait for it to finish or use a different --output-dir."
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "output": str(output_path),
+                "locked_at": utc_iso(),
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    handle.flush()
+    return OutputFileLock(path=lock_path, handle=handle)
+
+
+def release_output_file_lock(lock: OutputFileLock | None) -> None:
+    if lock is None or lock.handle is None:
+        return
+    try:
+        fcntl.flock(lock.handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.handle.close()
+        lock.handle = None
+
+
 @contextmanager
 def patched_env(updates: dict[str, str]) -> Iterable[None]:
     old_values = {key: os.environ.get(key) for key in updates}
@@ -136,7 +199,7 @@ def framework_feature_flags(framework: FrameworkSpec) -> dict[str, bool]:
 
 
 def utc_label() -> str:
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def enum_value(value: Any) -> str | None:
@@ -415,7 +478,7 @@ def build_failure_record(
         "elapsed_s": elapsed_s,
         "timeout_s": timeout_s,
         "external_failure": True,
-        "recorded_at": datetime.utcnow().isoformat() + "Z",
+        "recorded_at": utc_iso(),
     }
 
 
@@ -632,6 +695,45 @@ def load_previous_failures(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return list(failures or []) if isinstance(failures, list) else []
 
 
+def read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            rows.append(json.loads(raw))
+    return rows
+
+
+def merge_sidecar_results(
+    baseline_results: list[dict[str, Any]],
+    candidate_results: list[dict[str, Any]],
+    games_jsonl: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    rows = read_jsonl_rows(games_jsonl)
+    if not rows:
+        return baseline_results, candidate_results, 0
+    baseline_rows = [row for row in rows if str(row.get("side") or "") == "baseline"]
+    candidate_rows = [row for row in rows if str(row.get("side") or "") == "candidate"]
+    merged_baseline = dedupe_results_by_seed_side([*baseline_results, *baseline_rows])
+    merged_candidate = dedupe_results_by_seed_side([*candidate_results, *candidate_rows])
+    return merged_baseline, merged_candidate, len(rows)
+
+
+def merge_sidecar_failures(failures: list[dict[str, Any]], failures_jsonl: Path) -> tuple[list[dict[str, Any]], int]:
+    rows = read_jsonl_rows(failures_jsonl)
+    if not rows:
+        return failures, 0
+    merged: dict[tuple[Any, str, str], dict[str, Any]] = {}
+    for row in [*failures, *rows]:
+        key = (row.get("seed"), str(row.get("side") or ""), str(row.get("error_type") or ""))
+        merged[key] = row
+    return list(merged.values()), len(rows)
+
+
 def dedupe_results_by_seed_side(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_key: dict[tuple[int, str], dict[str, Any]] = {}
     for row in rows:
@@ -725,7 +827,7 @@ def write_partial(
     game_timeout_s: int,
 ) -> None:
     partial = {
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": utc_iso(),
         "target_role": target_role,
         "baseline_completed": len(baseline_results),
         "candidate_completed": len(candidate_results),
@@ -842,6 +944,7 @@ def main() -> int:
     baseline_results: list[dict[str, Any]] = []
     candidate_results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    output_lock: OutputFileLock | None = None
     if args.resume_from:
         resume_payload = read_json(args.resume_from)
         try:
@@ -878,6 +981,20 @@ def main() -> int:
         games_jsonl = args.output_dir / f"target_seat_ab_{args.target_role}_{label}.games.jsonl"
         failures_jsonl = args.output_dir / f"target_seat_ab_{args.target_role}_{label}.failures.jsonl"
         partial_path = args.output_dir / f"target_seat_ab_{args.target_role}_{label}.partial.json"
+    output_lock = acquire_output_file_lock(out)
+    atexit.register(release_output_file_lock, output_lock)
+    if args.resume_from and args.append:
+        baseline_results, candidate_results, sidecar_game_rows = merge_sidecar_results(
+            baseline_results,
+            candidate_results,
+            games_jsonl,
+        )
+        failures, sidecar_failure_rows = merge_sidecar_failures(failures, failures_jsonl)
+        if sidecar_game_rows or sidecar_failure_rows:
+            print(
+                "merged append sidecars "
+                f"games_jsonl_rows={sidecar_game_rows} failures_jsonl_rows={sidecar_failure_rows}"
+            )
     already_done = completed_sides_by_seed(baseline_results, candidate_results)
     if args.resume_from and not args.append:
         write_jsonl_rows(games_jsonl, [*baseline_results, *candidate_results])
@@ -969,7 +1086,7 @@ def main() -> int:
         require_positive_ci=not args.allow_ci_cross_zero,
     )
     output = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": utc_iso(),
         "elapsed_s": round(time.perf_counter() - started, 3),
         "runner": "target_seat_trackc_ab_experiment.py",
         "target_role": args.target_role,
@@ -1002,6 +1119,7 @@ def main() -> int:
     write_json(out, output)
     print(f"Wrote {out}")
     print(json.dumps(comparison, ensure_ascii=False, indent=2))
+    release_output_file_lock(output_lock)
     return 0
 
 
