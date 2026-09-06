@@ -1,18 +1,20 @@
-# 面向狼人杀博弈的多智能体认知决策与自进化系统
+# AI Werewolf
 
 <p align="center">
   <img src="docs/assets/ai-werewolf-icon.svg" alt="AI Werewolf logo" width="112">
 </p>
 
 <p align="center">
-  <strong>面向社会推理博弈的多智能体狼人杀研究平台</strong><br>
+  <strong>面向狼人杀博弈的多智能体认知决策与自进化系统</strong><br>
   Play complete games, evaluate every decision, and evolve reusable strategy knowledge.
 </p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
-[![PostgreSQL](https://img.shields.io/badge/db-PostgreSQL%2016-336791?logo=postgresql)](https://www.postgresql.org/)
-[![Next.js](https://img.shields.io/badge/frontend-Next.js%2014-black?logo=next.js)](https://nextjs.org/)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.8+-blue" alt="Python">
+  <img src="https://img.shields.io/badge/db-PostgreSQL%2016-336791?logo=postgresql" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/frontend-Next.js%2014-black?logo=next.js" alt="Next.js">
+</p>
 
 ## 项目定位
 
@@ -31,7 +33,7 @@
 
 ## 系统架构
 
-系统按”前端体验 -> API 编排 -> 规则引擎 -> Agent 决策 -> 复盘评测 -> 策略进化 -> 数据持久化”组织。前端只负责展示和交互，游戏真相、行动校验、阶段推进和私有信息过滤都在后端完成；Agent 只通过 `PlayerView` 观察局面，并以结构化 `Decision` 表达意图。
+系统按“前端体验 -> API 编排 -> 规则引擎 -> Agent 决策 -> 复盘评测 -> 策略进化 -> 数据持久化”组织。前端只负责展示和交互，游戏真相、行动校验、阶段推进和私有信息过滤都在后端完成；Agent 只通过 `PlayerView` 观察局面，并以结构化 `Decision` 表达意图。
 
 设计原则：
 
@@ -54,49 +56,7 @@
 | 前端能力 | 大厅、对局观战、真人操作、单局复盘、统计看板、人格配置页 |
 | 工程能力 | FastAPI REST/WebSocket、SQLAlchemy 持久化、配置化规则、严格信息隔离验证 |
 
-## 核心模块
-
-### 对局引擎
-
-入口：`backend/engine/game.py`
-
-`WerewolfGame` 是游戏状态的唯一写入者，负责初始化玩家、分配角色、推进昼夜阶段、结算技能、处理投票和判断胜负。Agent 不能直接修改状态，只能提交 `Decision`，再由引擎按当前阶段和规则裁决。
-
-### 阶段与行动规则
-
-入口：`backend/engine/phases.py`, `backend/engine/actions.py`
-
-阶段系统覆盖夜晚守卫、狼人行动、女巫行动、预言家查验、白天发言、警徽竞选、PK、投票、遗言和特殊技能。行动规则层负责检查 actor、target、技能次数和阶段约束，保证 LLM 输出不会绕过游戏规则。
-
-### 信息隔离
-
-入口：`backend/engine/visibility.py`
-
-系统将完整 `GameState` 投影为每个玩家自己的 `PlayerView`。狼人只看到狼队可见信息，预言家只看到自己的查验结果，观众公开视图会隐藏夜晚具体行动，信息边界由后端强制保证。
-
-### 角色注册与能力元数据
-
-入口：`backend/engine/roles/registry.py`
-
-RoleRegistry 是角色能力和展示信息的单一事实来源。可玩角色、模板角色、阵营、技能、夜晚顺序和前端展示都围绕它组织，方便后续扩展新角色而不破坏主流程。
-
-### Agent 运行时
-
-入口：`backend/agents/cognitive/`
-
-`CognitiveAgent` 将角色目标、人格风格、短期记忆、信任判断、工具调用和策略检索组合起来，再调用真实 LLM provider 生成结构化决策。AgentLoop 将“观察 -> 思考 -> 调工具 -> 输出 Decision”固定成可审计流程，便于复盘和调试。
-
-### 持久化与审计
-
-入口：`backend/db/models.py`, `backend/db/persist.py`
-
-系统将对局、玩家、事件、快照、Agent 决策、复盘报告、指标和策略知识写入数据库。这个审计链让一局游戏可以被回放、复盘、统计，也让 Track B 和 Track C 不依赖临时日志。
-
-### 前端体验
-
-入口：`frontend/app/`, `frontend/components/`, `frontend/hooks/`
-
-前端提供大厅、观战页、真人操作页、单局复盘页、统计看板和人格配置页。它只渲染后端给出的 public/private snapshot，不自行推断隐藏信息，从产品层配合后端信息隔离。
+核心模块设计详见 [`docs/PROJECT_MODULE_DESIGN.md`](docs/PROJECT_MODULE_DESIGN.md)，覆盖对局引擎、信息隔离、CognitiveAgent、AgentLoop、StrategyRetriever、PostgreSQL 证据链、PerStepScorer、Track C 知识层和前端控制台。
 
 ## Track B：复盘评测
 
@@ -126,55 +86,39 @@ Track C 的策略知识分两层触发：
 | 层级 | 触发方式 | 作用 |
 |---|---|---|
 | 赛后自动门禁 | 每局结束后由 `run_post_game_scoring()` 调用 `promote_after_store(source_game_id=game_id)` | 只处理本局新知识，按质量、聚类和使用反馈把候选晋级为 active，并做轻量归档 |
-| 批处理治理 | `promote.py --mode lifecycle --apply` | 对全库执行质量晋级、反馈晋级、active 池剪枝、candidate 池上限治理和低质归档 |
+| 批处理治理 | 本地治理脚本或数据库维护任务 | 对全库执行质量晋级、反馈晋级、active 池剪枝、candidate 池上限治理和低质归档 |
 
 生产 Agent 的策略检索只加载 `active` 策略。`candidate` 是候选知识池，不直接进入下一局 Prompt；批处理治理限制候选堆积，低质、过期或超量候选进入 `deprecated`。
 
+初始策略种子在 `configs/seed_strategies.json`（386 条 active 策略，覆盖 14 个角色），首次启动时加载即可获得基线策略能力。
+
 ## 快速开始
 
-### 1. 安装后端依赖
+### 方式一：Docker 一键启动
 
 ```bash
-pip install -r requirements.txt
 cp .env.example .env
+# 编辑 .env 填入 LLM_PROVIDER 和 API Key
+docker compose up -d
 ```
 
-编辑 `.env`，设置 `LLM_PROVIDER` 和对应 provider 的 API Key。正式 Demo 和结果统计使用真实 LLM provider。
+后端 `http://localhost:8000/docs`，前端 `http://localhost:3001`。
 
-### 2. 启动 PostgreSQL
+### 方式二：手动安装
 
 ```bash
-docker run -d --name werewolf-pg \
-  -e POSTGRES_USER=werewolf \
-  -e POSTGRES_PASSWORD=werewolf_dev_password \
-  -e POSTGRES_DB=werewolf \
-  -p 5433:5432 postgres:16-alpine
-
+cp .env.example .env
+pip install -r requirements.txt
+make dev                              # 后端 http://localhost:8000/docs
 ```
-
-未配置 `DATABASE_URL` 时，后端使用 SQLite 本地模式。
-
-### 3. 启动后端
-
-```bash
-make dev
-# http://localhost:8000/docs
-```
-
-### 4. 启动前端
 
 ```bash
 cd frontend
 npm install --legacy-peer-deps
-npm run dev
-# http://localhost:3001
+npm run dev                           # 前端 http://localhost:3001
 ```
 
-如果 3001 被占用：
-
-```bash
-PORT=3002 npm run dev
-```
+未配置 `DATABASE_URL` 时，后端使用 SQLite 本地模式，无需 PostgreSQL。
 
 ## Demo 路线
 
