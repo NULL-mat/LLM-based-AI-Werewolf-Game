@@ -825,7 +825,7 @@ Track B 将一局游戏拆分为多个可评价的决策步骤，并通过 `PerS
 
 ## 8\.1 代码仓库
 
-**Github仓库地址：****https://github\.com/wxhfy/AIwerewolf**
+**Github仓库地址：****https://github\.com/NULL-mat/LLM-based-AI-Werewolf-Game**
 
 ## 8\.2 前端 Demo 与截图
 

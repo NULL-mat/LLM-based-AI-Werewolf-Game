@@ -24,7 +24,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| GitHub 仓库 | https://github.com/wxhfy/AIwerewolf |
+| GitHub 仓库 | https://github.com/NULL-mat/LLM-based-AI-Werewolf-Game |
 | 小组成员 | AI Werewolf Team |
 
 主线能力：

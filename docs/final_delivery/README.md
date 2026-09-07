@@ -1,12 +1,12 @@
 # AI Werewolf Final Delivery
 
-GitHub 仓库：<https://github.com/wxhfy/AIwerewolf>
+GitHub 仓库：<https://github.com/NULL-mat/LLM-based-AI-Werewolf-Game>
 
 ## 提交项对应
 
 | 项目 | 位置 |
 | --- | --- |
-| 代码仓库 | <https://github.com/wxhfy/AIwerewolf> |
+| 代码仓库 | <https://github.com/NULL-mat/LLM-based-AI-Werewolf-Game> |
 | 产品原型 | `frontend/` |
 | 本地 Demo | 前端 `http://localhost:3001`，API `http://localhost:8000/docs` |
 | 技术文档 | `README.md`，`docs/ENGINEERING_ARCHITECTURE.md`，`DEPLOY.md` |

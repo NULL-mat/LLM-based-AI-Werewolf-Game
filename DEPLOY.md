@@ -3,7 +3,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/wxhfy/AIwerewolf.git
+git clone https://github.com/NULL-mat/LLM-based-AI-Werewolf-Game.git
 cd AIwerewolf
 cp .env.example .env
 # 编辑 .env，填入 API key
